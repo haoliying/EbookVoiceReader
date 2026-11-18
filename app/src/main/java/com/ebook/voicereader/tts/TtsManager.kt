@@ -115,6 +115,7 @@ class TtsManager(private val context: Context) {
     private var paragraphs: List<String> = emptyList()
     private var currentIndex = 0
     private var currentBookId: String? = null
+    private var currentBookTitle: String? = null
 
     fun setListener(l: Listener?) { listener = l }
 
@@ -151,8 +152,12 @@ class TtsManager(private val context: Context) {
 
     fun isReady() = ready
     fun isPaused() = paused
+    fun isPlaying() = speaking && !paused
     fun currentIndex() = currentIndex
     fun currentMode() = mode
+    fun currentBookId() = currentBookId
+    fun currentBookTitle() = currentBookTitle
+    fun setCurrentBookTitle(t: String?) { currentBookTitle = t }
     fun setSpeed(s: Float) { speed = s.coerceIn(0.5f, 2.0f) }
 
     /** 暴露给 ConverterService 用：单独合成一段文本 */

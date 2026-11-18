@@ -57,6 +57,14 @@
     <string name="convert_new_batch">选择更多文件</string>
     <string name="convert_cancel_all">取消全部</string>
     <string name="close">关闭</string>
+
+    <!-- 书库 -->
+    <string name="empty_library_title">书库里还没有书</string>
+    <string name="empty_library_desc">点击顶部「选择要转换的书籍」，一次选多本，后台自动转好语音缓存</string>
+    <string name="resume_reading">继续播放</string>
+    <string name="library_done">已缓存</string>
+    <string name="library_converting">转换中</string>
+    <string name="library_failed">失败</string>
     <string name="volume_zero_title">媒体音量为 0</string>
     <string name="volume_zero_msg">当前媒体音量为静音，朗读不会有声音。是否调高音量？</string>
     <string name="raise_volume">调高音量</string>

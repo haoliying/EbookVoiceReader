@@ -15,6 +15,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
+        android:name=".App"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
@@ -24,8 +25,9 @@
         android:largeHeap="true"
         tools:targetApi="34">
 
+        <!-- 书库（主入口） -->
         <activity
-            android:name=".MainActivity"
+            android:name=".LibraryActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize">
@@ -48,6 +50,13 @@
                 <data android:mimeType="application/msword" />
             </intent-filter>
         </activity>
+
+        <!-- 朗读页 -->
+        <activity
+            android:name=".ReaderActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".convert.ConvertService"

@@ -39,6 +39,7 @@ class CacheManager(private val context: Context) {
             val o = JSONObject(f.readText())
             Meta(
                 bookId = bookId,
+                sourceUri = o.optString("sourceUri", ""),
                 title = o.optString("title", bookId),
                 format = o.optString("format", ""),
                 paragraphCount = o.optInt("paragraphCount", 0),
@@ -54,6 +55,7 @@ class CacheManager(private val context: Context) {
 
     fun saveMeta(meta: Meta) {
         val o = JSONObject()
+            .put("sourceUri", meta.sourceUri)
             .put("title", meta.title)
             .put("format", meta.format)
             .put("paragraphCount", meta.paragraphCount)
@@ -128,6 +130,8 @@ class CacheManager(private val context: Context) {
 
     data class Meta(
         val bookId: String,
+        /** 原文档的 URI（持久化存储，下次打开同一本书时用） */
+        val sourceUri: String,
         val title: String,
         val format: String,
         val paragraphCount: Int,

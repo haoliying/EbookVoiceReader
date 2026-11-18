@@ -209,7 +209,7 @@ class ConvertService : Service() {
         } ?: 0
 
         val meta = CacheManager.Meta(
-            bookId = bookId, title = title, format = book.sourceFormat,
+            bookId = bookId, sourceUri = uri.toString(), title = title, format = book.sourceFormat,
             paragraphCount = total, totalSeconds = 0f,
             sampleRate = 22050, mode = mode.name.lowercase(),
             convertedUpTo = startFrom - 1,

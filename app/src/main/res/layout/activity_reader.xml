@@ -26,56 +26,56 @@
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
+            <ImageButton
+                android:id="@+id/btnBack"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@android:string/cancel"
+                android:padding="6dp"
+                android:src="@android:drawable/ic_menu_revert" />
+
             <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:orientation="vertical">
+                android:orientation="vertical"
+                android:layout_marginStart="4dp">
 
                 <TextView
-                    android:layout_width="wrap_content"
+                    android:id="@+id/tvTitle"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:letterSpacing="0.02"
-                    android:text="@string/app_name"
+                    android:ellipsize="end"
+                    android:maxLines="1"
                     android:textColor="@color/white"
-                    android:textSize="24sp"
+                    android:textSize="18sp"
                     android:textStyle="bold" />
 
                 <TextView
-                    android:id="@+id/tvHeaderHint"
-                    android:layout_width="wrap_content"
+                    android:id="@+id/tvEngineHint"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:text="@string/header_subtitle"
+                    android:layout_marginTop="2dp"
+                    android:text="@string/engine_loading"
                     android:textColor="@color/header_text_sub"
                     android:textSize="12sp" />
             </LinearLayout>
 
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnOpenFile"
-                style="@style/Widget.PillButton"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="@string/select_file"
-                android:textColor="@color/primary"
-                android:textStyle="bold"
-                app:backgroundTint="@color/white" />
-
             <TextView
-                android:id="@+id/btnConvert"
+                android:id="@+id/btnManual"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="6dp"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:clickable="true"
                 android:focusable="true"
                 android:padding="6dp"
-                android:text="@string/batch_convert"
+                android:text="@string/manual"
                 android:textColor="@color/white"
                 android:textSize="12sp" />
 
             <TextView
-                android:id="@+id/btnSettings"
+                android:id="@+id/btnChangelog"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="2dp"
@@ -83,28 +83,16 @@
                 android:clickable="true"
                 android:focusable="true"
                 android:padding="6dp"
-                android:text="@string/settings"
+                android:text="@string/changelog"
                 android:textColor="@color/white"
                 android:textSize="12sp" />
         </LinearLayout>
 
         <TextView
-            android:id="@+id/tvTitle"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:ellipsize="end"
-            android:maxLines="2"
-            android:textColor="@color/white"
-            android:textSize="16sp"
-            android:textStyle="bold"
-            android:visibility="gone" />
-
-        <TextView
             android:id="@+id/tvStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
+            android:layout_marginTop="8dp"
             android:alpha="0.85"
             android:textColor="@color/header_text_sub"
             android:textSize="12sp"
@@ -152,53 +140,6 @@
                     android:textColor="@color/text_primary"
                     android:textSize="17sp" />
             </ScrollView>
-
-            <!-- 空状态 -->
-            <LinearLayout
-                android:id="@+id/emptyState"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:gravity="center"
-                android:orientation="vertical"
-                android:padding="24dp">
-
-                <ImageView
-                    android:layout_width="88dp"
-                    android:layout_height="88dp"
-                    android:contentDescription="@string/empty_title"
-                    android:src="@drawable/ic_book" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="18dp"
-                    android:text="@string/empty_title"
-                    android:textColor="@color/text_primary"
-                    android:textSize="16sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:gravity="center"
-                    android:text="@string/empty_desc"
-                    android:textColor="@color/text_secondary"
-                    android:textSize="13sp" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="14dp"
-                    android:background="@drawable/bg_chip"
-                    android:paddingStart="14dp"
-                    android:paddingTop="6dp"
-                    android:paddingEnd="14dp"
-                    android:paddingBottom="6dp"
-                    android:text="@string/select_format_hint"
-                    android:textColor="@color/primary"
-                    android:textSize="11sp" />
-            </LinearLayout>
 
             <!-- 加载遮罩 -->
             <LinearLayout
@@ -258,70 +199,44 @@
                 android:gravity="center"
                 android:orientation="horizontal">
 
-                <FrameLayout
-                    android:layout_width="0dp"
-                    android:layout_height="56dp"
-                    android:layout_weight="1">
+                <ImageButton
+                    android:id="@+id/btnPrev"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/prev_para"
+                    android:src="@drawable/ic_skip_prev" />
 
-                    <ImageButton
-                        android:id="@+id/btnPrev"
-                        android:layout_width="46dp"
-                        android:layout_height="46dp"
-                        android:layout_gravity="center"
-                        android:background="?attr/selectableItemBackgroundBorderless"
-                        android:contentDescription="@string/prev_para"
-                        android:src="@drawable/ic_skip_prev" />
-                </FrameLayout>
+                <com.google.android.material.floatingactionbutton.FloatingActionButton
+                    android:id="@+id/btnPlayPause"
+                    android:layout_width="64dp"
+                    android:layout_height="64dp"
+                    android:layout_marginHorizontal="24dp"
+                    android:contentDescription="@string/play"
+                    android:src="@drawable/ic_play"
+                    app:backgroundTint="@color/primary"
+                    app:elevation="2dp"
+                    app:fabCustomSize="64dp"
+                    app:maxImageSize="28dp"
+                    app:rippleColor="#33FFFFFF"
+                    app:tint="@color/white" />
 
-                <FrameLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1.25">
+                <ImageButton
+                    android:id="@+id/btnNext"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/next_para"
+                    android:src="@drawable/ic_skip_next" />
 
-                    <com.google.android.material.floatingactionbutton.FloatingActionButton
-                        android:id="@+id/btnPlayPause"
-                        android:layout_width="64dp"
-                        android:layout_height="64dp"
-                        android:layout_gravity="center"
-                        android:contentDescription="@string/play"
-                        android:src="@drawable/ic_play"
-                        app:backgroundTint="@color/primary"
-                        app:elevation="2dp"
-                        app:fabCustomSize="64dp"
-                        app:maxImageSize="28dp"
-                        app:rippleColor="#33FFFFFF"
-                        app:tint="@color/white" />
-                </FrameLayout>
-
-                <FrameLayout
-                    android:layout_width="0dp"
-                    android:layout_height="56dp"
-                    android:layout_weight="1">
-
-                    <ImageButton
-                        android:id="@+id/btnNext"
-                        android:layout_width="46dp"
-                        android:layout_height="46dp"
-                        android:layout_gravity="center"
-                        android:background="?attr/selectableItemBackgroundBorderless"
-                        android:contentDescription="@string/next_para"
-                        android:src="@drawable/ic_skip_next" />
-                </FrameLayout>
-
-                <FrameLayout
-                    android:layout_width="0dp"
-                    android:layout_height="56dp"
-                    android:layout_weight="1">
-
-                    <ImageButton
-                        android:id="@+id/btnStop"
-                        android:layout_width="40dp"
-                        android:layout_height="40dp"
-                        android:layout_gravity="center"
-                        android:background="?attr/selectableItemBackgroundBorderless"
-                        android:contentDescription="@string/stop"
-                        android:src="@drawable/ic_stop" />
-                </FrameLayout>
+                <ImageButton
+                    android:id="@+id/btnStop"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:layout_marginStart="12dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/stop"
+                    android:src="@drawable/ic_stop" />
             </LinearLayout>
 
             <LinearLayout
@@ -353,39 +268,6 @@
                     android:layout_weight="1" />
 
                 <TextView
-                    android:id="@+id/btnManual"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:background="?attr/selectableItemBackgroundBorderless"
-                    android:clickable="true"
-                    android:focusable="true"
-                    android:padding="6dp"
-                    android:text="@string/manual"
-                    android:textColor="@color/primary"
-                    android:textSize="12sp" />
-
-                <TextView
-                    android:id="@+id/btnChangelog"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="10dp"
-                    android:background="?attr/selectableItemBackgroundBorderless"
-                    android:clickable="true"
-                    android:focusable="true"
-                    android:padding="6dp"
-                    android:text="@string/changelog"
-                    android:textColor="@color/primary"
-                    android:textSize="12sp" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="@string/speed"
@@ -394,11 +276,10 @@
 
                 <SeekBar
                     android:id="@+id/seekSpeed"
-                    android:layout_width="0dp"
+                    android:layout_width="100dp"
                     android:layout_height="wrap_content"
                     android:layout_marginStart="6dp"
-                    android:layout_marginEnd="10dp"
-                    android:layout_weight="1"
+                    android:layout_marginEnd="6dp"
                     android:max="15"
                     android:progress="5"
                     android:progressTint="@color/primary"
