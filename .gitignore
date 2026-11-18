@@ -42,3 +42,6 @@ captures/
 # External native build folder
 .externalNativeBuild/
 .cxx/
+
+# 双语语音模型体积超过 GitHub 单文件限制，使用 scripts/fetch-tts-model.sh 下载
+app/src/main/assets/tts/zh_en-melo/model.onnx

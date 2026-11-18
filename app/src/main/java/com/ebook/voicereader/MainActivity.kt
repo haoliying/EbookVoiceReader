@@ -124,6 +124,15 @@ class MainActivity : AppCompatActivity() {
         binding.btnPrev.setOnClickListener { ttsManager.previous() }
         binding.btnNext.setOnClickListener { ttsManager.next() }
 
+        binding.tvVoiceMode.setOnClickListener { showVoiceModeDialog() }
+        binding.btnManual.setOnClickListener {
+            showTextDialog(R.string.manual, R.string.manual_content)
+        }
+        binding.btnChangelog.setOnClickListener {
+            showTextDialog(R.string.changelog, R.string.changelog_content)
+        }
+        updateVoiceModeUi()
+
         binding.seekSpeed.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 val speed = 0.5f + progress * 0.1f
@@ -135,6 +144,47 @@ class MainActivity : AppCompatActivity() {
 
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
+    }
+
+    private fun updateVoiceModeUi() {
+        binding.tvVoiceMode.text =
+            getString(R.string.voice_mode_chip, getString(modeLabelRes(ttsManager.currentMode())))
+    }
+
+    private fun modeLabelRes(mode: TtsManager.Mode): Int = when (mode) {
+        TtsManager.Mode.MIXED -> R.string.mode_mixed
+        TtsManager.Mode.CHINESE -> R.string.mode_chinese
+    }
+
+    private fun showVoiceModeDialog() {
+        val modes = arrayOf(TtsManager.Mode.MIXED, TtsManager.Mode.CHINESE)
+        val labels = arrayOf(
+            "${getString(R.string.mode_mixed)} · ${getString(R.string.mode_mixed_desc)}",
+            "${getString(R.string.mode_chinese)} · ${getString(R.string.mode_chinese_desc)}"
+        )
+        val checked = modes.indexOf(ttsManager.currentMode()).coerceAtLeast(0)
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.voice_mode_title)
+            .setSingleChoiceItems(labels, checked) { dialog, which ->
+                ttsManager.setMode(modes[which])
+                updateVoiceModeUi()
+                Toast.makeText(
+                    this,
+                    getString(R.string.mode_switched, getString(modeLabelRes(modes[which]))),
+                    Toast.LENGTH_SHORT
+                ).show()
+                dialog.dismiss()
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showTextDialog(titleRes: Int, contentRes: Int) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle(titleRes)
+            .setMessage(contentRes)
+            .setPositiveButton(R.string.got_it, null)
+            .show()
     }
 
     private fun togglePlay() {

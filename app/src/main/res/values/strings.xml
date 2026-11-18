@@ -22,7 +22,7 @@
     <string name="file_open_failed">无法打开该文件</string>
     <string name="empty_content">未从文档中提取到文本</string>
     <string name="tts_not_ready">内置语音引擎尚未就绪</string>
-    <string name="engine_loading">正在加载内置离线语音…（首次约需数秒）</string>
+    <string name="engine_loading">正在加载内置离线语音…（首次约需 5 秒）</string>
     <string name="engine_ready">语音就绪：%1$s</string>
     <string name="engine_missing">语音引擎不可用</string>
     <string name="goto_settings">去设置</string>
@@ -32,4 +32,23 @@
     <string name="raise_volume">调高音量</string>
     <string name="finished">已朗读完毕</string>
     <string name="no_text_hint">文档中没有可朗读的文本</string>
+
+    <!-- 语音模式 -->
+    <string name="voice_mode">语音模式</string>
+    <string name="voice_mode_chip">语音模式 · %1$s</string>
+    <string name="voice_mode_title">选择语音模式</string>
+    <string name="mode_mixed">中英混读</string>
+    <string name="mode_mixed_desc">双语女声，英文按单词朗读</string>
+    <string name="mode_chinese">中文女声</string>
+    <string name="mode_chinese_desc">小雅音色，英文自动换双语声</string>
+    <string name="mode_switched">已切换为「%1$s」</string>
+
+    <!-- 操作手册与版本说明 -->
+    <string name="manual">操作手册</string>
+    <string name="changelog">版本说明</string>
+    <string name="got_it">知道了</string>
+
+    <string name="manual_content">1. 打开书籍\n点击右上角「选择文件」，支持 TXT、Markdown、PDF、DOCX、EPUB 和图片。也可以在文件管理器里用「其他应用打开」选择「朗读时光」。\n\n2. 开始朗读\n点击底部中央的圆形按钮开始朗读，再次点击暂停；右侧方形按钮停止并回到开头。朗读时正文会高亮当前段落并自动滚动。\n\n3. 切换语音模式\n点击底部「语音模式」：\n· 中英混读：中文与英文由同一个双语声音朗读，英文按完整单词发音，不会逐字母拼读。\n· 中文女声：中文使用「小雅」音色，遇到英文单词会自动改用双语声音。\n切换后若正在朗读，会从当前段落用新音色继续。\n\n4. 调整语速\n拖动「语速」滑块，可在 0.5 倍到 2.0 倍之间调整，实时生效。\n\n5. 切换段落\n点「上一段 / 下一段」按钮跳转，暂停时也会同步高亮目标段落。\n\n6. 图片与扫描版 PDF\n图片或扫描版 PDF 会先做离线 OCR 文字识别，页数较多时需要等待几秒，识别完成后即可朗读。\n\n7. 完全离线\n语音引擎、中文/英文发音模型和 OCR 模型都内置在应用内，不需要联网，也不会把书籍内容上传到任何服务器。\n\n8. 没有声音？\n请先检查媒体音量是否被调为 0；应用检测到静音时会给出提示。若提示「语音引擎加载失败」，请确认安装包完整，或重新安装。\n\n9. 注意\n小雅音色仅限非商业用途；其余组件均为开源许可，详见版本说明。</string>
+
+    <string name="changelog_content">v3.0（当前版本）\n· 新增「语音模式」选择：中英混读 / 中文女声\n· 新增内置中英双语语音引擎，支持中英文混读，英文按单词朗读\n· 不同引擎音量自动归一，避免忽大忽小\n· 新增操作手册与版本说明\n\nv2.0\n· 改用内置 sherpa-onnx 离线语音引擎，彻底摆脱对手机系统 TTS 的依赖\n· 内置「小雅」中文女声模型，无需下载语音包\n· 语音合成后通过 AudioTrack 直接播放，支持暂停与恢复\n\nv1.1\n· 修复点击朗读没有声音的问题\n· 重做界面配色、卡片布局、播放控件与启动图标\n\nv1.0\n· 首个版本：支持 TXT / Markdown / PDF / DOCX / EPUB 与图片 OCR 朗读\n\n开源组件\n· sherpa-onnx（Apache-2.0）\n· vits-piper-zh_CN-xiao_ya-medium-int8（非商业使用）\n· vits-melo-tts-zh_en（MIT）\n· ML Kit 文字识别、PdfBox-Android、Jsoup</string>
 </resources>
