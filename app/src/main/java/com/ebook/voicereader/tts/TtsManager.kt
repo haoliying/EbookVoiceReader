@@ -6,6 +6,8 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Handler
 import android.os.Looper
+import com.ebook.voicereader.cache.CacheManager
+import com.ebook.voicereader.cache.Prefs
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
@@ -25,36 +27,39 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * 内置离线语音合成引擎。
+ * 内置离线语音合成 + 播放引擎。
  *
  * 两个引擎都随 APK 打包，完全不依赖系统 TTS：
  * - 中文女声：vits-piper-zh_CN-xiao_ya-medium-int8（约 20MB）
  * - 中英双语：vits-melo-tts-zh_en（约 170MB，英文按单词朗读）
  *
- * 播放管线：
- * 1. 用户点击「朗读」后先预合成约 1 分钟（到段落边界），期间回调进度给 UI；
- * 2. 预合成完成才开始播放，播放过程中后台继续合成，始终领先一分钟；
- * 3. 因此听感上首段可能需要等待 ~1 分钟的准备，但开始播之后段落之间零等待。
+ * 三种播放模式：
+ * 1. **缓存播放**：如果某本书已被后台转换（CacheManager 里有 PCM 分片），
+ *    直接播放 PCM，完全跳过合成，打开就能听。
+ * 2. **实时预热播放**：未转换的书走实时模式，打开后先预热 N 秒（默认 15 秒，
+ *    在设置里可调 5–120 秒），播放时后台持续预合成。
+ * 3. **后台转换**：ConverterService 调用 [synthesizeParagraph] 把全书逐段合成、
+ *    写进 CacheManager，下次打开就变成模式 1。
  *
- * 每次用户操作递增 session，用于丢弃过期的合成结果。
- * ONNX Runtime 非线程安全，所以所有 engine.generate() 调用都经 [engineMutex] 串行。
+ * ONNX Runtime 非线程安全，所有 engine.generate() 都经 [engineMutex] 串行。
  */
 class TtsManager(private val context: Context) {
 
     enum class Mode {
         /** 中英混读：双语女声，英文按整词朗读 */
         MIXED,
-
-        /** 中文女声：中文段用「小雅」，英文段自动改用双语声 */
+        /** 中文女声：中文段用「小雅」，英文自动换双语 */
         CHINESE,
     }
 
     interface Listener {
         fun onEngineReady(info: String)
         fun onEngineUnavailable(reason: String)
-        /** 预合成阶段进度：已合成段数 + 已合成秒数 */
+        /** 预热阶段进度 */
         fun onPreparationProgress(doneParagraphs: Int, estimatedSeconds: Int)
         fun onPreparationComplete(paragraphsReady: Int)
+        /** 检测到有缓存可以直接播放 */
+        fun onCacheAvailable(convertedParagraphs: Int) {}
         fun onParagraphStart(index: Int)
         fun onSpeakingChanged(speaking: Boolean)
         fun onFinished()
@@ -66,94 +71,64 @@ class TtsManager(private val context: Context) {
         private const val DIR_MIXED = "tts/zh_en-melo"
         private const val MAX_CHUNK = 80
         private const val SAMPLE_CHUNK = 4096
-
-        /** 模型输出音量偏小，统一把峰值归一到该电平 */
         private const val TARGET_PEAK = 0.9f
         private const val MAX_GAIN = 6f
-
-        /** 打开文件后先预合成多少秒再开始播放 */
-        private const val WARMUP_SECONDS = 60
-
-        /** 播放过程中后台预合成的目标领先秒数（也是每段的上限） */
-        private const val LOOKAHEAD_SECONDS = 60
-
-        /** 一个安全的样本率兜底，万一引擎 sample_rate 拿不到 */
         private const val DEFAULT_SAMPLE_RATE = 22050
     }
 
-    /** 已合成并做过峰值归一化的 PCM 片段，随时可送 AudioTrack 播放 */
-    private class PreparedChunk(val samples: ShortArray, val sampleRate: Int, val durationSec: Float)
+    private class PreparedChunk(
+        val samples: ShortArray,
+        val sampleRate: Int,
+        val durationSec: Float,
+    )
+
+    private data class CacheChunk(
+        val samples: ShortArray,
+        val sampleRate: Int,
+    ) {
+        fun durationSec(): Float = samples.size.toFloat() / sampleRate
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
-
-    /** ONNX Runtime 非线程安全，所有 engine.generate 调用都经此锁串行 */
     private val engineMutex = Mutex()
 
-    private var listener: Listener? = null
+    private val prefs = Prefs(context)
+    private var cache: CacheManager? = null
 
+    private var listener: Listener? = null
     private var zhEngine: OfflineTts? = null
     private var mixedEngine: OfflineTts? = null
 
-    @Volatile
-    private var ready = false
-
-    @Volatile
-    private var mode = Mode.MIXED
-
-    @Volatile
-    private var session = 0
-
-    @Volatile
-    private var paused = false
-
-    @Volatile
-    private var stopRequested = true
-
-    @Volatile
-    private var speaking = false
-
-    @Volatile
-    private var speed = 1.0f
-
-    @Volatile
-    private var currentTrack: AudioTrack? = null
-
-    @Volatile
-    private var job: Job? = null
-
-    /** 预合成好的段落音频：paragraph index → 片段列表 */
+    @Volatile private var ready = false
+    @Volatile private var mode = Mode.MIXED
+    @Volatile private var session = 0
+    @Volatile private var paused = false
+    @Volatile private var stopRequested = true
+    @Volatile private var speaking = false
+    @Volatile private var speed = 1.0f
+    @Volatile private var currentTrack: AudioTrack? = null
+    @Volatile private var job: Job? = null
     private val precomputed = LinkedHashMap<Int, List<PreparedChunk>>()
-
-    /**
-     * 正在后台预合成下一段的协程。cancel 时需要把它也停掉，避免生成过期音频。
-     */
-    @Volatile
-    private var prefetchJob: Job? = null
+    @Volatile private var prefetchJob: Job? = null
 
     private var paragraphs: List<String> = emptyList()
     private var currentIndex = 0
+    private var currentBookId: String? = null
 
-    fun setListener(l: Listener?) {
-        listener = l
-    }
+    fun setListener(l: Listener?) { listener = l }
 
-    /** 加载两个引擎（耗时操作，完成后回调 onEngineReady） */
+    fun setCache(c: CacheManager) { cache = c }
+
+    /** 加载两个引擎（完成后回调 onEngineReady） */
     fun init() {
         scope.launch {
             var mixedError: String? = null
             var zhError: String? = null
-
-            try {
-                mixedEngine = buildEngine(DIR_MIXED)
-            } catch (e: Throwable) {
-                mixedError = e.message ?: e.javaClass.simpleName
-            }
-            try {
-                zhEngine = buildEngine(DIR_ZH)
-            } catch (e: Throwable) {
-                zhError = e.message ?: e.javaClass.simpleName
-            }
+            try { mixedEngine = buildEngine(DIR_MIXED) }
+            catch (e: Throwable) { mixedError = e.message ?: e.javaClass.simpleName }
+            try { zhEngine = buildEngine(DIR_ZH) }
+            catch (e: Throwable) { zhError = e.message ?: e.javaClass.simpleName }
 
             ready = mixedEngine != null || zhEngine != null
             if (ready) {
@@ -174,22 +149,32 @@ class TtsManager(private val context: Context) {
         }
     }
 
-    fun isReady(): Boolean = ready
+    fun isReady() = ready
+    fun isPaused() = paused
+    fun currentIndex() = currentIndex
+    fun currentMode() = mode
+    fun setSpeed(s: Float) { speed = s.coerceIn(0.5f, 2.0f) }
 
-    fun isPaused(): Boolean = paused
-
-    fun currentIndex(): Int = currentIndex
-
-    fun currentMode(): Mode = mode
-
-    fun setSpeed(s: Float) {
-        speed = s.coerceIn(0.5f, 2.0f)
+    /** 暴露给 ConverterService 用：单独合成一段文本 */
+    suspend fun synthesizeParagraph(text: String, mode: Mode = this.mode): Pair<ShortArray, Int>? {
+        if (!ready || text.isBlank()) return null
+        val chunks = synthesize(text, mode, session)
+        if (chunks.isEmpty()) return null
+        val rate = chunks.first().sampleRate
+        val out = ShortArray(chunks.sumOf { it.samples.size })
+        var off = 0
+        for (c in chunks) {
+            System.arraycopy(c.samples, 0, out, off, c.samples.size)
+            off += c.samples.size
+        }
+        return out to rate
     }
 
     /** 切换语音模式；正在朗读时从当前段落用新音色继续 */
     fun setMode(m: Mode) {
         if (m == mode) return
         mode = m
+        currentBookId = null // 模式变了缓存不可用
         clearPrecomputed()
         if (speaking && ready) {
             session++
@@ -197,16 +182,19 @@ class TtsManager(private val context: Context) {
             stopRequested = false
             paused = false
             notify { it.onSpeakingChanged(true) }
-            // 切换模式后从头预合成一小段，让用户立刻听到新音色
             scope.launch {
-                prepareLookaheadFrom(currentIndex, LOOKAHEAD_SECONDS, incrementSession = false)
+                prepareLookaheadFrom(currentIndex, prefs.lookaheadSeconds, incrementSession = false)
                 startPlaybackLoop(currentIndex)
             }
         }
     }
 
-    /** 开始朗读整本书 */
-    fun speak(all: List<String>, startIndex: Int = 0) {
+    /**
+     * 开始朗读一本书。
+     * 优先尝试 CacheManager 里的缓存：如果缓存完整直接进入播放循环，零等待；
+     * 否则走实时预热，预热秒数从 Prefs 读取（默认 15 秒）。
+     */
+    fun speak(all: List<String>, startIndex: Int = 0, bookId: String? = null) {
         if (!ready) {
             notify { it.onError("语音引擎正在加载，请稍候再试") }
             return
@@ -221,12 +209,34 @@ class TtsManager(private val context: Context) {
         paused = false
         stopRequested = false
         speaking = false
+        currentBookId = bookId
 
-        // 打开文件后先预合成 ~1 分钟，期间回调进度，完成后才进入播放循环
         val mySession = session
         scope.launch {
             try {
-                val done = prepareWarmup(currentIndex, WARMUP_SECONDS, mySession)
+                // 1) 缓存路径：存在缓存就直接播
+                val cache = cache
+                val bid = bookId
+                val meta = cache?.metaOf(bid ?: "")
+                if (cache != null && bid != null && meta != null && meta.status == CacheManager.Status.DONE &&
+                    meta.paragraphCount == all.size
+                ) {
+                    // 模式不一致时仍实时（不读旧音色缓存）
+                    val modeMatches = mode.name.lowercase() == meta.mode
+                    if (modeMatches || meta.mode.isEmpty()) {
+                        val converted = (0 until all.size).count { cache.hasChunk(bid, it) }
+                        notify { it.onCacheAvailable(converted) }
+                        speaking = true
+                        notify { it.onPreparationComplete(converted) }
+                        notify { it.onSpeakingChanged(true) }
+                        startCachedPlaybackLoop(bid, all.size, meta.sampleRate)
+                        return@launch
+                    }
+                }
+
+                // 2) 实时预热路径
+                val warmup = prefs.warmupSeconds
+                val done = prepareWarmup(currentIndex, warmup, mySession)
                 if (mySession != session || stopRequested) return@launch
                 notify { it.onPreparationComplete(done) }
                 speaking = true
@@ -255,14 +265,11 @@ class TtsManager(private val context: Context) {
         paused = false
         speaking = true
         val track = currentTrack
-        if (track != null) {
-            runCatching { track.play() }
-        }
+        if (track != null) runCatching { track.play() }
         notify { it.onSpeakingChanged(true) }
     }
 
     fun stop() {
-        if (!ready) return
         session++
         cancelPlayback()
         clearPrecomputed()
@@ -293,25 +300,45 @@ class TtsManager(private val context: Context) {
     }
 
     // ------------------------------------------------------------------
+    // 播放循环
+    // ------------------------------------------------------------------
 
-    private fun buildEngine(dir: String): OfflineTts {
-        val config = OfflineTtsConfig(
-            model = OfflineTtsModelConfig(
-                vits = OfflineTtsVitsModelConfig(
-                    model = "$dir/model.onnx",
-                    lexicon = "$dir/lexicon.txt",
-                    tokens = "$dir/tokens.txt",
-                ),
-                numThreads = 2,
-                debug = false,
-                provider = "cpu",
-            ),
-            // 数字、日期、电话号码的中文读法
-            ruleFsts = "$dir/date.fst,$dir/number.fst,$dir/phone.fst",
-            maxNumSentences = 1,
-            silenceScale = 0.15f,
-        )
-        return OfflineTts(assetManager = context.assets, config = config)
+    private suspend fun startCachedPlaybackLoop(bookId: String, paraCount: Int, sampleRate: Int) {
+        var idx = currentIndex
+        while (idx in 0 until paraCount) {
+            if (stopRequested) return
+            val mySession = session
+            val chunk = cache?.readChunk(bookId, idx)
+            notify { it.onParagraphStart(idx) }
+            if (chunk != null) {
+                val dur = chunk.size.toFloat() / sampleRate
+                playRawParagraph(listOf(CacheChunk(chunk, sampleRate)), dur, mySession)
+            }
+            if (stopRequested) return
+            idx++
+            currentIndex = idx
+        }
+        finishAll()
+    }
+
+    private suspend fun startPlaybackLoop(startIndex: Int) {
+        var idx = startIndex
+        while (idx in paragraphs.indices) {
+            if (stopRequested) return
+            val mySession = session
+            prefetchJob?.cancel()
+            prefetchJob = scope.launch {
+                prepareLookaheadFrom(idx + 1, prefs.lookaheadSeconds)
+            }
+            notify { it.onParagraphStart(idx) }
+            val audio = precomputed.remove(idx)
+                ?: prepareParagraph(paragraphs[idx], mySession)
+            if (audio.isNotEmpty()) playPreparedParagraph(audio, mySession)
+            if (stopRequested) return
+            idx++
+            currentIndex = idx
+        }
+        finishAll()
     }
 
     private fun jumpTo(index: Int) {
@@ -324,31 +351,35 @@ class TtsManager(private val context: Context) {
         if (wasPlaying) {
             stopRequested = false
             notify { it.onSpeakingChanged(true) }
-            // 跳转后也要先预合成一小段，避免跳过去就断
             scope.launch {
-                prepareLookaheadFrom(currentIndex, LOOKAHEAD_SECONDS, incrementSession = false)
-                startPlaybackLoop(currentIndex)
+                val bid = currentBookId
+                val meta = bid?.let { cache?.metaOf(it) }
+                if (bid != null && meta != null && meta.status == CacheManager.Status.DONE &&
+                    mode.name.lowercase() == meta.mode
+                ) {
+                    startCachedPlaybackLoop(bid, meta.paragraphCount, meta.sampleRate)
+                } else {
+                    prepareLookaheadFrom(currentIndex, prefs.lookaheadSeconds, incrementSession = false)
+                    startPlaybackLoop(currentIndex)
+                }
             }
         } else {
             notify { it.onParagraphStart(index) }
         }
     }
 
-    /**
-     * 打开文件后的首轮预合成：从 startIndex 起累计合成到目标秒数（或文档结束）。
-     * 每合成完一段就回调 onPreparationProgress，让 UI 显示进度。
-     * 返回预合成了多少段。
-     */
+    // ------------------------------------------------------------------
+    // 预热 + 预合成
+    // ------------------------------------------------------------------
+
     private suspend fun prepareWarmup(startIndex: Int, targetSeconds: Int, mySession: Int): Int {
         var doneSeconds = 0f
         var done = 0
-        var rate = DEFAULT_SAMPLE_RATE
         for (idx in startIndex until paragraphs.size) {
             if (mySession != session || stopRequested) break
             val audio = prepareParagraph(paragraphs[idx], mySession)
             if (audio.isEmpty()) continue
             precomputed[idx] = audio
-            rate = audio.first().sampleRate
             done++
             doneSeconds += audio.fold(0f) { a, c -> a + c.durationSec }
             notify { it.onPreparationProgress(done, doneSeconds.toInt()) }
@@ -357,19 +388,13 @@ class TtsManager(private val context: Context) {
         return done
     }
 
-    /**
-     * 播放中的后台预合成：从 fromIndex 起补到 targetSeconds 左右即可，不累积太多。
-     */
     private suspend fun prepareLookaheadFrom(
-        fromIndex: Int,
-        targetSeconds: Int,
-        incrementSession: Boolean = true
+        fromIndex: Int, targetSeconds: Int, incrementSession: Boolean = true
     ) {
         val mySession = if (incrementSession) ++session else session
         var doneSeconds = precomputed.entries
             .filter { it.key >= fromIndex }
             .fold(0f) { acc, e -> acc + e.value.fold(0f) { a, c -> a + c.durationSec } }
-
         var idx = max(fromIndex, currentIndex + precomputed.size)
         while (idx < paragraphs.size && doneSeconds < targetSeconds) {
             if (mySession != session || stopRequested) return
@@ -378,78 +403,67 @@ class TtsManager(private val context: Context) {
             precomputed[idx] = audio
             doneSeconds += audio.fold(0f) { a, c -> a + c.durationSec }
             idx++
-            // 控制预合成缓存上限，避免吃掉太多内存
             while (precomputed.size > 5) {
                 precomputed.entries.firstOrNull()?.let { precomputed.remove(it.key) }
             }
         }
     }
 
-    /**
-     * 进入播放循环：播放当前段，后台预合成后续段，段落间无缝衔接。
-     */
-    private suspend fun startPlaybackLoop(startIndex: Int) {
-        var idx = startIndex
-        while (idx in paragraphs.indices) {
-            if (stopRequested) return
-            val mySession = session
-
-            // 后台预合成 idx+1 起的后续段，和播放并行
-            prefetchJob?.cancel()
-            prefetchJob = scope.launch {
-                prepareLookaheadFrom(idx + 1, LOOKAHEAD_SECONDS)
+    /** 内部合成：切句 → 语言分段 → engine.generate → 归一 */
+    private suspend fun synthesize(
+        text: String, modeOverride: Mode, mySession: Int
+    ): List<PreparedChunk> {
+        if (text.isBlank()) return emptyList()
+        val out = mutableListOf<PreparedChunk>()
+        val oldMode = mode
+        mode = modeOverride
+        try {
+            for (chunk in splitChunks(text)) {
+                for ((chinese, part) in segmentsOf(chunk)) {
+                    val engine = engineFor(modeOverride, chinese) ?: continue
+                    val audio = engineMutex.withLock {
+                        withContext(Dispatchers.Default) { engine.generate(part, 0, speed) }
+                    }
+                    if (audio.samples.isNotEmpty()) {
+                        out.add(normalize(audio.samples, audio.sampleRate))
+                    }
+                }
             }
-
-            notify { it.onParagraphStart(idx) }
-            val audio = precomputed.remove(idx)
-                ?: prepareParagraph(paragraphs[idx], mySession)
-
-            if (audio.isNotEmpty()) {
-                playParagraph(audio, mySession)
-            }
-            if (stopRequested) return
-            idx++
+        } finally {
+            mode = oldMode
         }
-        finishAll()
+        return out
     }
 
-    private fun engineFor(chinese: Boolean): OfflineTts? = when (mode) {
+    private suspend fun prepareParagraph(text: String, mySession: Int) =
+        synthesize(text, mode, mySession)
+
+    private fun engineFor(m: Mode, chinese: Boolean): OfflineTts? = when (m) {
         Mode.MIXED -> mixedEngine ?: if (chinese) zhEngine else null
         Mode.CHINESE -> if (chinese) zhEngine ?: mixedEngine else mixedEngine
     }
 
-    /**
-     * 按语言切分片段。
-     * 混读模式整段交给双语引擎；中文模式再把中文段与英文段分开。
-     */
-    private fun segmentsOf(chunk: String): List<Pair<Boolean, String>> {
-        if (mode == Mode.MIXED) return listOf(false to chunk)
-        return splitByLanguage(chunk).ifEmpty { listOf(true to chunk) }
-    }
+    private fun segmentsOf(chunk: String): List<Pair<Boolean, String>> =
+        if (mode == Mode.MIXED) listOf(false to chunk)
+        else splitByLanguage(chunk).ifEmpty { listOf(true to chunk) }
 
-    /**
-     * 把文本切成「中文段 / 英文段」。
-     * 数字与空格、标点跟随前一个语言，保证「2023年」整体读中文、「GPT-4」整体读英文。
-     */
     private fun splitByLanguage(text: String): List<Pair<Boolean, String>> {
         val parts = mutableListOf<Pair<Boolean, StringBuilder>>()
-        var currentChinese = true
+        var curChinese = true
         for (c in text) {
             val chinese = when {
                 isChinese(c) -> true
                 c.isLetter() -> false
-                else -> currentChinese
+                else -> curChinese
             }
-            currentChinese = chinese
+            curChinese = chinese
             if (parts.isEmpty() || parts.last().first != chinese) {
                 parts.add(chinese to StringBuilder().append(c))
             } else {
                 parts.last().second.append(c)
             }
         }
-        return parts
-            .map { it.first to it.second.toString().trim() }
-            .filter { it.second.isNotEmpty() }
+        return parts.map { it.first to it.second.toString().trim() }.filter { it.second.isNotEmpty() }
     }
 
     private fun isChinese(c: Char): Boolean {
@@ -458,14 +472,6 @@ class TtsManager(private val context: Context) {
         return c in "，。！？；：、“”‘’（）《》〈〉【】…—～·「」『』"
     }
 
-    private fun finishAll() {
-        clearPrecomputed()
-        speaking = false
-        notify { it.onSpeakingChanged(false) }
-        notify { it.onFinished() }
-    }
-
-    /** 把文本切成短句，首句更快出声 */
     private fun splitChunks(text: String): List<String> {
         val sentences = text.split(Regex("(?<=[。！？；!?;\\n])"))
         val out = mutableListOf<String>()
@@ -474,20 +480,13 @@ class TtsManager(private val context: Context) {
             val s = raw.trim()
             if (s.isEmpty()) continue
             if (s.length > MAX_CHUNK) {
-                if (buf.isNotEmpty()) {
-                    out.add(buf.toString())
-                    buf = StringBuilder()
-                }
+                if (buf.isNotEmpty()) { out.add(buf.toString()); buf = StringBuilder() }
                 var i = 0
-                while (i < s.length) {
-                    out.add(s.substring(i, min(i + MAX_CHUNK, s.length)))
-                    i += MAX_CHUNK
-                }
+                while (i < s.length) { out.add(s.substring(i, min(i + MAX_CHUNK, s.length))); i += MAX_CHUNK }
                 continue
             }
             if (buf.length + s.length > MAX_CHUNK && buf.isNotEmpty()) {
-                out.add(buf.toString())
-                buf = StringBuilder()
+                out.add(buf.toString()); buf = StringBuilder()
             }
             buf.append(s)
         }
@@ -495,34 +494,9 @@ class TtsManager(private val context: Context) {
         return out.ifEmpty { listOf(text) }
     }
 
-    /** 把一个段落切成若干合成片段、串行合成、做峰值归一 */
-    private suspend fun prepareParagraph(text: String, mySession: Int): List<PreparedChunk> {
-        if (text.isBlank()) return emptyList()
-        val out = mutableListOf<PreparedChunk>()
-        for (chunk in splitChunks(text)) {
-            if (mySession != session || stopRequested) break
-            for ((chinese, part) in segmentsOf(chunk)) {
-                if (mySession != session || stopRequested) break
-                val engine = engineFor(chinese) ?: continue
-                // ONNX Runtime 非线程安全，所有 generate 都要串行
-                val audio = engineMutex.withLock {
-                    withContext(Dispatchers.Default) { engine.generate(part, 0, speed) }
-                }
-                if (audio.samples.isNotEmpty()) {
-                    out.add(normalize(audio.samples, audio.sampleRate))
-                }
-            }
-        }
-        return out
-    }
-
-    /** 把合成出的 float PCM 做峰值归一化并转成 ShortArray */
     private fun normalize(samples: FloatArray, sampleRate: Int): PreparedChunk {
         var peak = 0f
-        for (v in samples) {
-            val a = abs(v)
-            if (a > peak) peak = a
-        }
+        for (v in samples) { val a = abs(v); if (a > peak) peak = a }
         val gain = if (peak > 0.01f) (TARGET_PEAK / peak).coerceIn(1f, MAX_GAIN) else 1f
         val shorts = ShortArray(samples.size)
         for (i in samples.indices) {
@@ -531,30 +505,35 @@ class TtsManager(private val context: Context) {
         return PreparedChunk(shorts, sampleRate, shorts.size.toFloat() / sampleRate)
     }
 
-    /** 把整个段落的 PreparedChunk 列表用同一个 AudioTrack 无缝播放 */
-    private suspend fun playParagraph(chunks: List<PreparedChunk>, mySession: Int) {
+    private suspend fun playPreparedParagraph(chunks: List<PreparedChunk>, mySession: Int) {
         if (chunks.isEmpty()) return
         val sampleRate = chunks.first().sampleRate
+        val raw = chunks.map { CacheChunk(it.samples, it.sampleRate) }
+        val dur = chunks.fold(0f) { a, c -> a + c.durationSec }
+        playRawParagraph(raw, dur, mySession)
+    }
 
+    private suspend fun playRawParagraph(
+        chunks: List<CacheChunk>, totalDurationSec: Float, mySession: Int
+    ) {
+        if (chunks.isEmpty()) return
+        val sampleRate = chunks.first().sampleRate
         val minBuf = AudioTrack.getMinBufferSize(
             sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
-        // 开大缓冲，段落切换时 AudioTrack 还能继续播，给预合成留时间
-        val bufSize = max(minBuf, 65536).coerceAtMost(sampleRate * 2 * 2 /* 最多 2 秒 */)
+        val bufSize = max(minBuf, 65536).coerceAtMost(sampleRate * 4 /* 最多 4 秒缓冲 */)
 
         val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
             )
             .setAudioFormat(
                 AudioFormat.Builder()
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build()
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
             )
             .setBufferSizeInBytes(bufSize)
             .setTransferMode(AudioTrack.MODE_STREAM)
@@ -568,7 +547,6 @@ class TtsManager(private val context: Context) {
                 if (mySession != session || stopRequested) return
                 while (paused && mySession == session && !stopRequested) delay(50)
                 if (mySession != session || stopRequested) return
-
                 var off = 0
                 while (off < chunk.samples.size && mySession == session && !stopRequested) {
                     while (paused && mySession == session && !stopRequested) delay(50)
@@ -579,18 +557,13 @@ class TtsManager(private val context: Context) {
                         AudioTrack.WRITE_BLOCKING
                     )
                     if (n <= 0) break
-                    off += n
-                    written += n
+                    off += n; written += n
                 }
             }
-            // 等 track 把所有已写入的样本播完
             while (mySession == session && !stopRequested &&
                 track.playbackHeadPosition < written
-            ) {
-                delay(30)
-            }
-        } catch (e: IllegalStateException) {
-            // 被 stop() 杀掉时 track 可能已释放
+            ) { delay(30) }
+        } catch (_: IllegalStateException) {
         } finally {
             if (currentTrack === track) currentTrack = null
             runCatching { track.stop() }
@@ -598,19 +571,38 @@ class TtsManager(private val context: Context) {
         }
     }
 
+    private fun buildEngine(dir: String): OfflineTts {
+        val config = OfflineTtsConfig(
+            model = OfflineTtsModelConfig(
+                vits = OfflineTtsVitsModelConfig(
+                    model = "$dir/model.onnx",
+                    lexicon = "$dir/lexicon.txt",
+                    tokens = "$dir/tokens.txt",
+                ),
+                numThreads = 2, debug = false, provider = "cpu",
+            ),
+            ruleFsts = "$dir/date.fst,$dir/number.fst,$dir/phone.fst",
+            maxNumSentences = 1, silenceScale = 0.15f,
+        )
+        return OfflineTts(assetManager = context.assets, config = config)
+    }
+
+    private fun finishAll() {
+        clearPrecomputed()
+        speaking = false
+        notify { it.onSpeakingChanged(false) }
+        notify { it.onFinished() }
+    }
+
     private fun clearPrecomputed() {
-        prefetchJob?.cancel()
-        prefetchJob = null
-        precomputed.clear()
+        prefetchJob?.cancel(); prefetchJob = null; precomputed.clear()
     }
 
     private fun cancelPlayback() {
         clearPrecomputed()
         stopRequested = true
-        job?.cancel()
-        job = null
-        val track = currentTrack
-        currentTrack = null
+        job?.cancel(); job = null
+        val track = currentTrack; currentTrack = null
         if (track != null) {
             runCatching { track.pause() }
             runCatching { track.flush() }

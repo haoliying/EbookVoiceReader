@@ -10,6 +10,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 转换完成后显示通知（Android 13+） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="true"
@@ -20,6 +23,7 @@
         android:theme="@style/Theme.EbookVoiceReader"
         android:largeHeap="true"
         tools:targetApi="34">
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -44,6 +48,15 @@
                 <data android:mimeType="application/msword" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".convert.ConvertService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="后台转换电子书为离线语音"/>
+        </service>
     </application>
 
 </manifest>

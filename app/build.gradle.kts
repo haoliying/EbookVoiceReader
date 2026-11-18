@@ -11,8 +11,8 @@ android {
         applicationId = "com.ebook.voicereader"
         minSdk = 24
         targetSdk = 34
-        versionCode = 6
-        versionName = "3.2"
+        versionCode = 7
+        versionName = "3.3"
 
         ndk {
             // sherpa-onnx 内置预编译 so，覆盖主流真机与 x86_64 模拟器
@@ -76,6 +76,9 @@ dependencies {
 
     // Lifecycle
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+
+    // PreferenceManager.getDefaultSharedPreferences（轻量持久化）
+    implementation("androidx.preference:preference-ktx:1.2.1")
 
     // 内置离线语音合成引擎（sherpa-onnx，Apache-2.0，含 VITS 中文模型）
     implementation(files("libs/sherpa-onnx-1.13.8.aar"))

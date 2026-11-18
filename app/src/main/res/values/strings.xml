@@ -4,6 +4,8 @@
 
     <string name="header_subtitle">打开任意书籍，离线为你朗读</string>
     <string name="select_file">选择文件</string>
+    <string name="batch_convert">批量转换</string>
+    <string name="settings">设置</string>
     <string name="select_format_hint">支持 TXT · MD · PDF · DOCX · EPUB · 图片</string>
 
     <string name="empty_title">还没有打开书籍</string>
@@ -29,6 +31,28 @@
     <string name="engine_missing">语音引擎不可用</string>
     <string name="goto_settings">去设置</string>
     <string name="cancel">取消</string>
+
+    <!-- 设置页 -->
+    <string name="settings_title">朗读设置</string>
+    <string name="warmup_label">实时模式预热秒数</string>
+    <string name="warmup_hint">打开未转换的书籍时，先预合成多少秒再开始播放。数值越大首段等得越久，但段落间切换越顺滑。</string>
+    <string name="lookahead_label">后台持续预合成秒数</string>
+    <string name="default_mode_label">默认语音模式</string>
+    <string name="cache_size_label">已转换离线语音缓存</string>
+    <string name="cache_clean">清理缓存</string>
+    <string name="cache_clean_confirm">确定删除全部离线转换结果吗？下次打开这些书会重新进入实时模式。</string>
+    <string name="cache_clean_done">已清理缓存</string>
+    <string name="cache_empty">尚未转换任何书籍，缓存为空</string>
+
+    <!-- 缓存可用提示 -->
+    <string name="cache_available_title">检测到离线语音</string>
+    <string name="cache_available_msg">这本书已转换好离线语音（共 %1$d 段），将直接播放、零等待。</string>
+
+    <!-- 批量转换 -->
+    <string name="convert_pick_files">选择要转换的书籍</string>
+    <string name="convert_start">开始后台转换</string>
+    <string name="convert_cancel">取消转换</string>
+    <string name="convert_pick_mode">后台转换时使用的语音模式</string>
     <string name="volume_zero_title">媒体音量为 0</string>
     <string name="volume_zero_msg">当前媒体音量为静音，朗读不会有声音。是否调高音量？</string>
     <string name="raise_volume">调高音量</string>
