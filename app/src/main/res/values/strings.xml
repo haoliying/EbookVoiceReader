@@ -53,6 +53,10 @@
     <string name="convert_start">开始后台转换</string>
     <string name="convert_cancel">取消转换</string>
     <string name="convert_pick_mode">后台转换时使用的语音模式</string>
+    <string name="convert_queue_title">转换队列</string>
+    <string name="convert_new_batch">选择更多文件</string>
+    <string name="convert_cancel_all">取消全部</string>
+    <string name="close">关闭</string>
     <string name="volume_zero_title">媒体音量为 0</string>
     <string name="volume_zero_msg">当前媒体音量为静音，朗读不会有声音。是否调高音量？</string>
     <string name="raise_volume">调高音量</string>
