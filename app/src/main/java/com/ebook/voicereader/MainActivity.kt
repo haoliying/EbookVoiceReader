@@ -1,8 +1,10 @@
 package com.ebook.voicereader
 
 import android.content.Intent
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.text.Spannable
 import android.text.SpannableStringBuilder
 import android.text.style.BackgroundColorSpan
@@ -11,12 +13,14 @@ import android.widget.SeekBar
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.ebook.voicereader.databinding.ActivityMainBinding
 import com.ebook.voicereader.model.Book
 import com.ebook.voicereader.ocr.OcrEngine
 import com.ebook.voicereader.reader.DocumentReaderFactory
 import com.ebook.voicereader.tts.TtsManager
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
@@ -32,6 +36,7 @@ class MainActivity : AppCompatActivity() {
 
     private var ttsReady = false
     private var isPlaying = false
+    private var engineError: String? = null
 
     private val openDocument = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -45,78 +50,68 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         ocrEngine = OcrEngine()
+        setupTts()
+        setupViews()
+
+        handleIncomingIntent(intent)
+    }
+
+    private fun setupTts() {
         ttsManager = TtsManager(this)
         ttsManager.setListener(object : TtsManager.Listener {
-            override fun onInitSuccess() {
+            override fun onEngineReady(languageName: String) {
                 ttsReady = true
+                engineError = null
                 runOnUiThread {
-                    Toast.makeText(this@MainActivity, R.string.app_name, Toast.LENGTH_SHORT).show()
+                    binding.tvHeaderHint.text = getString(R.string.engine_ready, languageName)
                 }
             }
 
-            override fun onInitFailed() {
-                runOnUiThread {
-                    Toast.makeText(this@MainActivity, R.string.tts_not_ready, Toast.LENGTH_LONG).show()
-                }
+            override fun onEngineUnavailable(reason: String) {
+                ttsReady = false
+                engineError = reason
+                runOnUiThread { binding.tvHeaderHint.text = reason }
             }
 
             override fun onParagraphStart(index: Int) {
                 runOnUiThread { highlightParagraph(index) }
             }
 
-            override fun onParagraphDone(index: Int) {}
-
             override fun onSpeakingChanged(speaking: Boolean) {
+                runOnUiThread { updatePlayState(speaking) }
+            }
+
+            override fun onFinished() {
                 runOnUiThread {
-                    isPlaying = speaking
-                    binding.btnPlayPause.text = if (speaking) {
-                        getString(R.string.pause)
-                    } else {
-                        getString(R.string.play)
-                    }
+                    Toast.makeText(this@MainActivity, R.string.finished, Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            override fun onError(message: String) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
                 }
             }
         })
         ttsManager.init()
-
-        setupViews()
-
-        // 支持从外部应用打开文件
-        handleIncomingIntent(intent)
     }
 
     private fun setupViews() {
         binding.btnOpenFile.setOnClickListener {
-            val mimeTypes = arrayOf(
-                "text/plain", "text/markdown",
-                "application/pdf",
-                "application/epub+zip",
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "application/msword",
-                "image/*",
-                "*/*"
+            openDocument.launch(
+                arrayOf(
+                    "text/plain", "text/markdown",
+                    "application/pdf",
+                    "application/epub+zip",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "application/msword",
+                    "image/*",
+                    "*/*"
+                )
             )
-            openDocument.launch(mimeTypes)
         }
 
-        binding.btnPlayPause.setOnClickListener {
-            val book = currentBook
-            if (book == null || book.paragraphs.isEmpty()) {
-                Toast.makeText(this, R.string.empty_content, Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (!ttsReady) {
-                Toast.makeText(this, R.string.tts_not_ready, Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (isPlaying) {
-                ttsManager.pause()
-            } else if (ttsManager.isPaused()) {
-                ttsManager.resume()
-            } else {
-                ttsManager.speak(book.paragraphs, ttsManager.currentIndex())
-            }
-        }
+        binding.btnPlayPause.setOnClickListener { togglePlay() }
 
         binding.btnStop.setOnClickListener {
             ttsManager.stop()
@@ -132,9 +127,78 @@ class MainActivity : AppCompatActivity() {
                 binding.tvSpeedValue.text = String.format("%.1fx", speed)
                 ttsManager.setSpeed(speed)
             }
+
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
+    }
+
+    private fun togglePlay() {
+        val book = currentBook
+        if (book == null || book.paragraphs.isEmpty()) {
+            Toast.makeText(this, R.string.empty_content, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!ttsReady) {
+            val reason = engineError
+            if (reason != null) showEngineDialog(reason)
+            else Toast.makeText(this, R.string.tts_not_ready, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (isPlaying) {
+            ttsManager.pause()
+        } else {
+            ensureVolume()
+            if (ttsManager.isPaused()) {
+                ttsManager.resume()
+            } else {
+                ttsManager.speak(book.paragraphs, ttsManager.currentIndex())
+            }
+        }
+    }
+
+    /** 媒体音量为 0 时提示用户，避免“点了没声音” */
+    private fun ensureVolume() {
+        val am = getSystemService(AudioManager::class.java) ?: return
+        if (am.getStreamVolume(AudioManager.STREAM_MUSIC) > 0) return
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.volume_zero_title)
+            .setMessage(R.string.volume_zero_msg)
+            .setPositiveButton(R.string.raise_volume) { _, _ ->
+                am.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.ADJUST_RAISE,
+                    AudioManager.FLAG_SHOW_UI
+                )
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showEngineDialog(reason: String) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.engine_missing)
+            .setMessage(reason)
+            .setPositiveButton(R.string.goto_settings) { _, _ ->
+                val intent = try {
+                    Intent("com.android.settings.TTS_SETTINGS")
+                } catch (e: Exception) {
+                    Intent(Settings.ACTION_SETTINGS)
+                }
+                runCatching { startActivity(intent) }
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun updatePlayState(speaking: Boolean) {
+        isPlaying = speaking
+        binding.btnPlayPause.setImageResource(
+            if (speaking) R.drawable.ic_pause else R.drawable.ic_play
+        )
+        binding.btnPlayPause.contentDescription =
+            getString(if (speaking) R.string.pause else R.string.play)
     }
 
     private fun handleIncomingIntent(intent: Intent?) {
@@ -152,23 +216,25 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        binding.progressBar.visibility = View.VISIBLE
-        binding.tvStatus.text = getString(R.string.loading)
-        binding.tvContent.text = ""
+        ttsManager.stop()
+        clearHighlight()
+        binding.loadingOverlay.visibility = View.VISIBLE
+        binding.tvLoading.text = getString(R.string.loading)
+        binding.emptyState.visibility = View.GONE
 
         lifecycleScope.launch {
             try {
                 val book = reader.read(this@MainActivity, uri, displayName) { progress ->
                     runOnUiThread {
-                        binding.tvStatus.text =
+                        binding.tvLoading.text =
                             "${getString(R.string.loading)} ${(progress * 100).toInt()}%"
                     }
                 }
                 showBook(book)
             } catch (e: Exception) {
                 runOnUiThread {
-                    binding.progressBar.visibility = View.GONE
-                    binding.tvStatus.text = getString(R.string.file_open_failed)
+                    binding.loadingOverlay.visibility = View.GONE
+                    binding.emptyState.visibility = View.VISIBLE
                     Toast.makeText(
                         this@MainActivity,
                         "${getString(R.string.file_open_failed)}: ${e.message}",
@@ -182,65 +248,81 @@ class MainActivity : AppCompatActivity() {
     private fun showBook(book: Book) {
         runOnUiThread {
             currentBook = book
+            binding.emptyState.visibility = View.GONE
+            binding.loadingOverlay.visibility = View.GONE
+
+            binding.tvTitle.visibility = View.VISIBLE
             binding.tvTitle.text = book.title
+
+            binding.tvStatus.visibility = View.VISIBLE
             binding.tvStatus.text = buildString {
-                append("格式：").append(book.sourceFormat.uppercase())
-                append("  |  段落：").append(book.paragraphs.size)
-                if (book.usedOcr) append("  |  ").append(getString(R.string.ocr_hint))
+                append(book.sourceFormat.uppercase())
+                append(" · ")
+                append(book.paragraphs.size)
+                append(" 段")
+                if (book.usedOcr) {
+                    append(" · ")
+                    append(getString(R.string.ocr_hint))
+                }
             }
 
             val fullText = book.paragraphs.joinToString("\n\n")
-            val ssb = SpannableStringBuilder(fullText)
-            binding.tvContent.text = ssb
+            binding.tvContent.text = SpannableStringBuilder(fullText)
+            binding.scrollView.scrollTo(0, 0)
 
-            // 预计算每段在全文中的偏移
             val offsets = mutableListOf<Pair<Int, Int>>()
             var pos = 0
-            for ((i, p) in book.paragraphs.withIndex()) {
+            for (p in book.paragraphs) {
                 val start = pos
                 val end = pos + p.length
                 offsets.add(start to end)
-                pos = end + 2 // "\n\n"
+                pos = end + 2
             }
             paragraphOffsets = offsets
 
-            binding.progressBar.visibility = View.GONE
+            if (book.paragraphs.isEmpty()) {
+                binding.tvContent.text = getString(R.string.no_text_hint)
+            }
         }
     }
 
     /** 高亮当前朗读段落 */
     private fun highlightParagraph(index: Int) {
         val ssb = SpannableStringBuilder(binding.tvContent.text)
-        // 移除上一次高亮
-        if (highlightedSpan != null) {
-            ssb.removeSpan(highlightedSpan)
-            highlightedSpan = null
-        }
+        highlightedSpan?.let { ssb.removeSpan(it) }
+        highlightedSpan = null
+
         if (index in paragraphOffsets.indices) {
             val (start, end) = paragraphOffsets[index]
-            val span = BackgroundColorSpan(0x33FF6F00)
-            ssb.setSpan(span, start, end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-            highlightedSpan = span
-            binding.tvContent.text = ssb
-            // 滚动到当前段落
-            scrollToParagraph(start)
+            if (end <= ssb.length) {
+                val span = BackgroundColorSpan(
+                    ContextCompat.getColor(this, R.color.highlight)
+                )
+                ssb.setSpan(span, start, end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                highlightedSpan = span
+                binding.tvContent.text = ssb
+                scrollToParagraph(start)
+            }
         }
     }
 
     private fun clearHighlight() {
-        if (highlightedSpan != null) {
+        highlightedSpan?.let {
             val ssb = SpannableStringBuilder(binding.tvContent.text)
-            ssb.removeSpan(highlightedSpan)
+            ssb.removeSpan(it)
             highlightedSpan = null
             binding.tvContent.text = ssb
         }
     }
 
     private fun scrollToParagraph(charOffset: Int) {
-        val layout = binding.tvContent.layout ?: return
-        val line = layout.getLineForOffset(charOffset)
-        val y = layout.getLineTop(line)
-        binding.scrollView.smoothScrollTo(0, y - binding.scrollView.height / 3)
+        binding.tvContent.post {
+            val layout = binding.tvContent.layout ?: return@post
+            if (charOffset > binding.tvContent.text.length) return@post
+            val line = layout.getLineForOffset(charOffset)
+            val y = layout.getLineTop(line)
+            binding.scrollView.smoothScrollTo(0, (y - binding.scrollView.height / 3).coerceAtLeast(0))
+        }
     }
 
     private fun getDisplayName(uri: Uri): String {

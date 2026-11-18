@@ -1,42 +1,55 @@
 package com.ebook.voicereader.tts
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import java.util.Locale
 
 /**
- * 离线语音合成管理器。
+ * 离线语音合成管理器（系统 TextToSpeech 引擎）。
  *
- * 基于 Android 系统 TextToSpeech 引擎。系统 TTS 引擎（如 Google 文字转语音、
- * 各厂商语音引擎）在下载对应语言包后可完全离线使用，无需网络。
- *
- * 实现要点：
- * - 使用 QUEUE_ADD + UtteranceProgressListener 实现段落间链式朗读；
- * - 每个段落分配唯一 utteranceId，在 onDone 中推进到下一段；
- * - 暂停通过 stop + 记录当前索引实现，恢复时从当前索引继续。
+ * 关键点：
+ * 1. 必须显式设置语言。若不设置，部分设备默认语言为英文，中文文本会被静默跳过 → 完全无声。
+ * 2. 必须检查 setLanguage 返回值，LANG_MISSING_DATA / LANG_NOT_SUPPORTED 说明系统缺少离线语音包。
+ * 3. 一次只投递一个段落（QUEUE_FLUSH），在 onDone 中推进下一段，避免部分引擎在 stop() 后丢弃队列。
  */
 class TtsManager(private val context: Context) {
 
     interface Listener {
-        fun onInitSuccess()
-        fun onInitFailed()
+        /** 引擎就绪，且语言可用。languageName 为实际使用的语言名 */
+        fun onEngineReady(languageName: String)
+
+        /** 引擎不可用 / 缺少语音数据，reason 用于提示用户 */
+        fun onEngineUnavailable(reason: String)
+
         fun onParagraphStart(index: Int)
-        fun onParagraphDone(index: Int)
+
+        /** 播放状态变化（true=正在朗读） */
         fun onSpeakingChanged(speaking: Boolean)
+
+        /** 全部段落读完 */
+        fun onFinished()
+
+        /** 朗读过程中的错误 */
+        fun onError(message: String)
     }
 
     private var tts: TextToSpeech? = null
-    private var initialized = false
     private var listener: Listener? = null
+
+    @Volatile
+    private var ready = false
+
+    @Volatile
+    private var languageOk = false
 
     private var paragraphs: List<String> = emptyList()
     private var currentIndex = 0
-    private var isPaused = false
+    private var paused = false
     private var speed = 1.0f
-
-    @Volatile
-    private var autoAdvance = true
+    private var currentLocale: Locale? = null
 
     fun setListener(l: Listener?) {
         listener = l
@@ -44,60 +57,171 @@ class TtsManager(private val context: Context) {
 
     fun init() {
         tts = TextToSpeech(context.applicationContext) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                initialized = true
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {
-                        val idx = utteranceId?.removePrefix("para_")?.toIntOrNull()
-                        if (idx != null) listener?.onParagraphStart(idx)
-                    }
+            if (status != TextToSpeech.SUCCESS) {
+                ready = false
+                listener?.onEngineUnavailable(
+                    "语音引擎初始化失败，设备可能未安装文字转语音（TTS）服务"
+                )
+                return@TextToSpeech
+            }
+            val engine = tts ?: return@TextToSpeech
+            engine.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            engine.setPitch(1.0f)
 
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(utteranceId: String?) {
-                        onDone(utteranceId)
-                    }
+            val (ok, name) = applyBestLanguage(engine)
+            languageOk = ok
+            // 语速必须在设置语言之后再设置，部分引擎切换语言会重置语速
+            engine.setSpeechRate(speed)
 
-                    override fun onDone(utteranceId: String?) {
-                        val idx = utteranceId?.removePrefix("para_")?.toIntOrNull()
-                        if (idx != null) listener?.onParagraphDone(idx)
-                        if (autoAdvance && idx != null && idx == currentIndex) {
-                            currentIndex++
-                            if (currentIndex < paragraphs.size && !isPaused) {
-                                speakCurrent()
-                            } else if (currentIndex >= paragraphs.size) {
-                                listener?.onSpeakingChanged(false)
-                            }
-                        }
+            engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {
+                    val idx = indexOf(utteranceId) ?: return
+                    listener?.onParagraphStart(idx)
+                }
+
+                override fun onDone(utteranceId: String?) {
+                    val idx = indexOf(utteranceId) ?: return
+                    if (paused || idx != currentIndex) return
+                    currentIndex++
+                    if (currentIndex < paragraphs.size) {
+                        speakCurrent()
+                    } else {
+                        listener?.onSpeakingChanged(false)
+                        listener?.onFinished()
                     }
-                })
-                listener?.onInitSuccess()
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onError(utteranceId: String?) {
+                    listener?.onError("语音合成出错，请检查系统语音引擎")
+                }
+
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    listener?.onError(errorMessage(errorCode))
+                    listener?.onSpeakingChanged(false)
+                }
+
+                override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                    // 主动 stop 时无需处理
+                }
+            })
+
+            ready = true
+            if (ok) {
+                listener?.onEngineReady(name)
             } else {
-                initialized = false
-                listener?.onInitFailed()
+                listener?.onEngineUnavailable(
+                    "系统缺少可用的中文离线语音包，请在「系统设置 → 文字转语音」中安装后重试"
+                )
             }
         }
     }
 
-    /** 设置朗读语速 (0.5 ~ 2.0) */
+    /**
+     * 应用可用语言，优先简体中文（本应用主要面向中文书籍）。
+     * 返回 (是否可用, 语言显示名)。
+     */
+    private fun applyBestLanguage(engine: TextToSpeech): Pair<Boolean, String> {
+        val candidates = listOf(
+            Locale.SIMPLIFIED_CHINESE,
+            Locale.getDefault(),
+            Locale.CHINESE,
+            Locale.US
+        )
+        for (locale in candidates) {
+            if (trySetLocale(engine, locale)) {
+                currentLocale = locale
+                val display = locale.displayName.ifBlank { locale.toString() }
+                return true to display
+            }
+        }
+        return false to ""
+    }
+
+    private fun trySetLocale(engine: TextToSpeech, locale: Locale): Boolean {
+        val result = try {
+            engine.setLanguage(locale)
+        } catch (e: Exception) {
+            TextToSpeech.LANG_NOT_SUPPORTED
+        }
+        return result != TextToSpeech.LANG_MISSING_DATA &&
+            result != TextToSpeech.LANG_NOT_SUPPORTED
+    }
+
+    /**
+     * 根据文本内容切换中/英语音。
+     * 中文书籍配英文引擎时会静默无声，因此朗读前必须检查。
+     */
+    private fun ensureLanguageForText(sampleText: String): Boolean {
+        val engine = tts ?: return false
+        val hasCjk = sampleText.any { it.code in 0x4E00..0x9FFF }
+        val wantZh = hasCjk
+        val current = currentLocale
+
+        if (wantZh) {
+            if (current?.language == "zh") return true
+            for (locale in listOf(Locale.SIMPLIFIED_CHINESE, Locale.CHINESE)) {
+                if (trySetLocale(engine, locale)) {
+                    currentLocale = locale
+                    engine.setSpeechRate(speed)
+                    return true
+                }
+            }
+            listener?.onError("系统缺少中文语音包，请在「设置 → 文字转语音」中下载")
+            return false
+        } else {
+            if (current?.language == "en") return true
+            for (locale in listOf(Locale.getDefault(), Locale.US, Locale.UK)) {
+                if (trySetLocale(engine, locale)) {
+                    currentLocale = locale
+                    engine.setSpeechRate(speed)
+                    return true
+                }
+            }
+            // 没有英语语音包时保留当前语言继续朗读
+            return true
+        }
+    }
+
+    private fun errorMessage(code: Int): String = when (code) {
+        TextToSpeech.ERROR_SYNTHESIS -> "语音合成失败，请检查语音包是否完整"
+        TextToSpeech.ERROR_INVALID_REQUEST -> "无效的朗读请求"
+        TextToSpeech.ERROR_NETWORK -> "语音引擎需要联网，请安装离线语音包"
+        TextToSpeech.ERROR_NETWORK_TIMEOUT -> "语音引擎网络超时"
+        TextToSpeech.ERROR_NOT_INSTALLED_YET -> "语音数据尚未安装完成"
+        TextToSpeech.ERROR_OUTPUT -> "音频输出失败，请检查媒体音量"
+        TextToSpeech.ERROR_SERVICE -> "语音服务异常"
+        else -> "语音合成出错（错误码 $code）"
+    }
+
+    /** 引擎是否可用（初始化完成且语言可用） */
+    fun isReady(): Boolean = ready && languageOk
+
+    fun isEngineInitialized(): Boolean = ready
+
     fun setSpeed(s: Float) {
         speed = s.coerceIn(0.5f, 2.0f)
         tts?.setSpeechRate(speed)
     }
 
-    /** 设置语言，中文优先 */
-    fun setLanguage(locale: Locale = Locale.CHINESE) {
-        tts?.language = locale
-    }
+    fun getSpeed(): Float = speed
 
     /**
-     * 开始朗读段落列表。
+     * 开始/重新开始朗读整本书。
      */
-    fun speak(paragraphs: List<String>, startIndex: Int = 0) {
-        if (!initialized || paragraphs.isEmpty()) return
-        this.paragraphs = paragraphs
-        this.currentIndex = startIndex.coerceIn(0, paragraphs.size - 1)
-        this.isPaused = false
-        this.autoAdvance = true
+    fun speak(allParagraphs: List<String>, startIndex: Int = 0) {
+        if (!isReady() || allParagraphs.isEmpty()) return
+        // 根据内容切换语音，避免中文配英文引擎导致无声
+        val sample = allParagraphs.take(3).joinToString(" ")
+        if (!ensureLanguageForText(sample)) return
+        paragraphs = allParagraphs
+        currentIndex = startIndex.coerceIn(0, allParagraphs.size - 1)
+        paused = false
         tts?.stop()
         tts?.setSpeechRate(speed)
         listener?.onSpeakingChanged(true)
@@ -105,70 +229,72 @@ class TtsManager(private val context: Context) {
     }
 
     private fun speakCurrent() {
-        if (currentIndex >= paragraphs.size || currentIndex < 0) return
-        val text = paragraphs[currentIndex]
-        if (text.isBlank()) {
+        if (currentIndex !in paragraphs.indices) return
+        val engine = tts ?: return
+        val text = paragraphs[currentIndex].trim()
+        if (text.isEmpty()) {
+            // 跳过空段落
             currentIndex++
-            speakCurrent()
+            if (currentIndex < paragraphs.size) speakCurrent()
+            else {
+                listener?.onSpeakingChanged(false)
+                listener?.onFinished()
+            }
             return
         }
-        val params = HashMap<String, String>().apply {
-            put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "para_$currentIndex")
+        val utteranceId = "p$currentIndex"
+        val params = Bundle().apply {
+            putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
         }
-        // QUEUE_ADD 保证语流连续，onDone 负责推进
-        tts?.speak(text, TextToSpeech.QUEUE_ADD, params)
+        // 单段投递，避免队列被 stop() 清空导致无声
+        val ret = engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        if (ret == TextToSpeech.ERROR) {
+            listener?.onError("语音播放失败，请确认媒体音量与语音包")
+            listener?.onSpeakingChanged(false)
+        }
     }
 
-    /** 暂停：停止当前朗读，保留索引 */
     fun pause() {
-        if (!initialized) return
-        isPaused = true
+        if (!ready) return
+        paused = true
         tts?.stop()
         listener?.onSpeakingChanged(false)
     }
 
-    /** 恢复：从当前索引继续 */
     fun resume() {
-        if (!initialized || paragraphs.isEmpty()) return
-        isPaused = false
-        autoAdvance = true
+        if (!isReady() || paragraphs.isEmpty()) return
+        paused = false
         listener?.onSpeakingChanged(true)
         speakCurrent()
     }
 
-    /** 停止并重置 */
     fun stop() {
-        if (!initialized) return
-        isPaused = true
-        autoAdvance = false
+        if (!ready) return
+        paused = true
         tts?.stop()
         currentIndex = 0
         listener?.onSpeakingChanged(false)
     }
 
-    /** 上一段 */
     fun previous() {
         if (paragraphs.isEmpty()) return
         currentIndex = (currentIndex - 1).coerceAtLeast(0)
-        if (!isPaused) {
+        if (!paused) {
             tts?.stop()
             speakCurrent()
         }
     }
 
-    /** 下一段 */
     fun next() {
         if (paragraphs.isEmpty()) return
         currentIndex = (currentIndex + 1).coerceAtMost(paragraphs.size - 1)
-        if (!isPaused) {
+        if (!paused) {
             tts?.stop()
             speakCurrent()
         }
     }
 
-    fun isSpeaking(): Boolean = tts?.isSpeaking == true
-
-    fun isPaused(): Boolean = isPaused
+    fun isPaused(): Boolean = paused
 
     fun currentIndex(): Int = currentIndex
 
@@ -176,6 +302,10 @@ class TtsManager(private val context: Context) {
         tts?.stop()
         tts?.shutdown()
         tts = null
-        initialized = false
+        ready = false
+        languageOk = false
     }
+
+    private fun indexOf(utteranceId: String?): Int? =
+        utteranceId?.removePrefix("p")?.toIntOrNull()
 }
