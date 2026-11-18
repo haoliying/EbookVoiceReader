@@ -4,7 +4,6 @@ import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
-import android.provider.Settings
 import android.text.Spannable
 import android.text.SpannableStringBuilder
 import android.text.style.BackgroundColorSpan
@@ -50,6 +49,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         ocrEngine = OcrEngine()
+        binding.tvHeaderHint.text = getString(R.string.engine_loading)
         setupTts()
         setupViews()
 
@@ -59,18 +59,21 @@ class MainActivity : AppCompatActivity() {
     private fun setupTts() {
         ttsManager = TtsManager(this)
         ttsManager.setListener(object : TtsManager.Listener {
-            override fun onEngineReady(languageName: String) {
+            override fun onEngineReady(info: String) {
                 ttsReady = true
                 engineError = null
                 runOnUiThread {
-                    binding.tvHeaderHint.text = getString(R.string.engine_ready, languageName)
+                    binding.tvHeaderHint.text = info
                 }
             }
 
             override fun onEngineUnavailable(reason: String) {
                 ttsReady = false
                 engineError = reason
-                runOnUiThread { binding.tvHeaderHint.text = reason }
+                runOnUiThread {
+                    binding.tvHeaderHint.text = reason
+                    Toast.makeText(this@MainActivity, reason, Toast.LENGTH_LONG).show()
+                }
             }
 
             override fun onParagraphStart(index: Int) {
@@ -141,9 +144,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!ttsReady) {
-            val reason = engineError
-            if (reason != null) showEngineDialog(reason)
-            else Toast.makeText(this, R.string.tts_not_ready, Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this,
+                engineError ?: getString(R.string.tts_not_ready),
+                Toast.LENGTH_SHORT
+            ).show()
             return
         }
         if (isPlaying) {
@@ -171,22 +176,6 @@ class MainActivity : AppCompatActivity() {
                     AudioManager.ADJUST_RAISE,
                     AudioManager.FLAG_SHOW_UI
                 )
-            }
-            .setNegativeButton(R.string.cancel, null)
-            .show()
-    }
-
-    private fun showEngineDialog(reason: String) {
-        MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.engine_missing)
-            .setMessage(reason)
-            .setPositiveButton(R.string.goto_settings) { _, _ ->
-                val intent = try {
-                    Intent("com.android.settings.TTS_SETTINGS")
-                } catch (e: Exception) {
-                    Intent(Settings.ACTION_SETTINGS)
-                }
-                runCatching { startActivity(intent) }
             }
             .setNegativeButton(R.string.cancel, null)
             .show()

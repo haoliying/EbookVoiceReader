@@ -11,8 +11,13 @@ android {
         applicationId = "com.ebook.voicereader"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "2.0"
+
+        ndk {
+            // sherpa-onnx 内置预编译 so，覆盖主流真机与 x86_64 模拟器
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
     }
 
     buildTypes {
@@ -33,6 +38,10 @@ android {
     }
     buildFeatures {
         viewBinding = true
+    }
+    androidResources {
+        // 模型与词典需以未压缩方式打包，供原生层直接读取
+        noCompress += listOf("onnx", "fst", "txt")
     }
     packaging {
         resources {
@@ -67,4 +76,7 @@ dependencies {
 
     // Lifecycle
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+
+    // 内置离线语音合成引擎（sherpa-onnx，Apache-2.0，含 VITS 中文模型）
+    implementation(files("libs/sherpa-onnx-1.13.8.aar"))
 }

@@ -21,7 +21,8 @@
     <string name="ocr_hint">OCR 识别</string>
     <string name="file_open_failed">无法打开该文件</string>
     <string name="empty_content">未从文档中提取到文本</string>
-    <string name="tts_not_ready">语音引擎未就绪</string>
+    <string name="tts_not_ready">内置语音引擎尚未就绪</string>
+    <string name="engine_loading">正在加载内置离线语音…（首次约需数秒）</string>
     <string name="engine_ready">语音就绪：%1$s</string>
     <string name="engine_missing">语音引擎不可用</string>
     <string name="goto_settings">去设置</string>
