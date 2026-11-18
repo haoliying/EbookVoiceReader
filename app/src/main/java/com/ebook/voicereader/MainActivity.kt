@@ -76,6 +76,25 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            override fun onPreparationProgress(doneParagraphs: Int, estimatedSeconds: Int) {
+                runOnUiThread {
+                    binding.btnPlayPause.isEnabled = false
+                    binding.btnPlayPause.alpha = 0.6f
+                    binding.tvHeaderHint.text = getString(
+                        R.string.preparing_voice,
+                        doneParagraphs, estimatedSeconds
+                    )
+                }
+            }
+
+            override fun onPreparationComplete(paragraphsReady: Int) {
+                runOnUiThread {
+                    binding.btnPlayPause.isEnabled = true
+                    binding.btnPlayPause.alpha = 1f
+                    binding.tvHeaderHint.text = getString(R.string.preparation_done, paragraphsReady)
+                }
+            }
+
             override fun onParagraphStart(index: Int) {
                 runOnUiThread { highlightParagraph(index) }
             }
@@ -93,6 +112,8 @@ class MainActivity : AppCompatActivity() {
             override fun onError(message: String) {
                 runOnUiThread {
                     Toast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+                    binding.btnPlayPause.isEnabled = true
+                    binding.btnPlayPause.alpha = 1f
                 }
             }
         })

@@ -24,6 +24,8 @@
     <string name="tts_not_ready">内置语音引擎尚未就绪</string>
     <string name="engine_loading">正在加载内置离线语音…（首次约需 5 秒）</string>
     <string name="engine_ready">语音就绪：%1$s</string>
+    <string name="preparing_voice">正在准备语音… 已合成 %1$d 段 / 约 %2$d 秒</string>
+    <string name="preparation_done">准备完成，开始朗读（已合成 %1$d 段）</string>
     <string name="engine_missing">语音引擎不可用</string>
     <string name="goto_settings">去设置</string>
     <string name="cancel">取消</string>
