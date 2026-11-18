@@ -17,6 +17,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -68,6 +69,9 @@ class TtsManager(private val context: Context) {
         private const val MAX_GAIN = 6f
     }
 
+    /** 已合成并做过峰值归一化的 PCM 片段，随时可送 AudioTrack 播放 */
+    private class PreparedChunk(val samples: ShortArray, val sampleRate: Int)
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -102,6 +106,15 @@ class TtsManager(private val context: Context) {
 
     @Volatile
     private var job: Job? = null
+
+    /** 预合成好的段落音频：paragraph index → 片段列表 */
+    private val precomputed = LinkedHashMap<Int, List<PreparedChunk>>()
+
+    /**
+     * 正在后台预合成下一段的协程。cancel 时需要把它也停掉，避免生成过期音频。
+     */
+    @Volatile
+    private var prefetchJob: Job? = null
 
     private var paragraphs: List<String> = emptyList()
     private var currentIndex = 0
@@ -162,6 +175,7 @@ class TtsManager(private val context: Context) {
     fun setMode(m: Mode) {
         if (m == mode) return
         mode = m
+        clearPrecomputed()
         if (speaking && ready) {
             session++
             cancelPlayback()
@@ -181,6 +195,7 @@ class TtsManager(private val context: Context) {
         if (all.isEmpty()) return
 
         cancelPlayback()
+        clearPrecomputed()
         session++
         paragraphs = all
         currentIndex = startIndex.coerceIn(0, all.size - 1)
@@ -266,6 +281,7 @@ class TtsManager(private val context: Context) {
         val wasPlaying = !paused && speaking
         session++
         cancelPlayback()
+        clearPrecomputed()
         currentIndex = index
         if (wasPlaying) {
             stopRequested = false
@@ -282,27 +298,28 @@ class TtsManager(private val context: Context) {
             return
         }
         val mySession = session
+
         job = scope.launch {
             try {
-                val text = paragraphs[currentIndex]
-                if (text.isBlank()) {
+                notify { it.onParagraphStart(currentIndex) }
+
+                // 先启动后台预合成下一段；当前段若已经算好就直接拿，否则现场合成
+                val prefetch = prefetchNext(currentIndex + 1, mySession)
+
+                val audioList = precomputed.remove(currentIndex)
+                    ?: prepareParagraph(paragraphs[currentIndex], mySession)
+
+                if (audioList.isEmpty()) {
                     advance(mySession)
                     return@launch
                 }
-                notify { it.onParagraphStart(currentIndex) }
 
-                for (chunk in splitChunks(text)) {
-                    if (mySession != session || stopRequested) return@launch
-                    for ((chinese, part) in segmentsOf(chunk)) {
-                        if (mySession != session || stopRequested) return@launch
-                        val engine = engineFor(chinese) ?: continue
-                        val audio = engine.generate(part, 0, speed)
-                        if (mySession != session || stopRequested) return@launch
-                        if (audio.samples.isEmpty()) continue
-                        playSamples(audio.samples, audio.sampleRate, mySession)
-                        if (mySession != session || stopRequested) return@launch
-                    }
-                }
+                // 所有片段用同一个 AudioTrack 无缝串起来，避免每段都重建 track
+                playParagraph(audioList, mySession)
+
+                // 等后台预合成结束，确保 precomputed 已经有下一段
+                prefetch?.join()
+
                 advance(mySession)
             } catch (e: CancellationException) {
                 throw e
@@ -312,6 +329,153 @@ class TtsManager(private val context: Context) {
                 notify { it.onSpeakingChanged(false) }
             }
         }
+    }
+
+    /**
+     * 后台预合成下一段，完成后塞进 precomputed。
+     * 返回的 Job 可 join 等待，null 表示没有下一段。
+     */
+    private fun prefetchNext(index: Int, mySession: Int): Job? {
+        if (index >= paragraphs.size) return null
+        if (precomputed.containsKey(index)) return null // 已有，跳过
+        prefetchJob?.cancel()
+        prefetchJob = scope.launch {
+            if (mySession != session) return@launch
+            val list = prepareParagraph(paragraphs[index], mySession)
+            if (mySession == session && !stopRequested) {
+                precomputed[index] = list
+                // 控制内存，只保留最近两段预合成
+                while (precomputed.size > 3) {
+                    precomputed.entries.firstOrNull()?.let { precomputed.remove(it.key) }
+                }
+            }
+        }
+        return prefetchJob
+    }
+
+    /** 把一个段落切成若干合成片段并做峰值归一，返回随时可播的音频列表 */
+    private suspend fun prepareParagraph(text: String, mySession: Int): List<PreparedChunk> {
+        if (text.isBlank()) return emptyList()
+        val out = mutableListOf<PreparedChunk>()
+        for (chunk in splitChunks(text)) {
+            if (mySession != session || stopRequested) break
+            for ((chinese, part) in segmentsOf(chunk)) {
+                if (mySession != session || stopRequested) break
+                val engine = engineFor(chinese) ?: continue
+                // 合成本身是同步 native 调用，用 Default dispatcher 让出 IO 线程
+                val audio = withContext(Dispatchers.Default) { engine.generate(part, 0, speed) }
+                if (audio.samples.isNotEmpty()) {
+                    out.add(normalize(audio.samples, audio.sampleRate))
+                }
+            }
+        }
+        return out
+    }
+
+    /** 把合成出的 float PCM 做峰值归一化并转成 ShortArray */
+    private fun normalize(samples: FloatArray, sampleRate: Int): PreparedChunk {
+        var peak = 0f
+        for (v in samples) {
+            val a = abs(v)
+            if (a > peak) peak = a
+        }
+        val gain = if (peak > 0.01f) (TARGET_PEAK / peak).coerceIn(1f, MAX_GAIN) else 1f
+        val shorts = ShortArray(samples.size)
+        for (i in samples.indices) {
+            shorts[i] = (samples[i] * gain * 32767f).toInt().coerceIn(-32768, 32767).toShort()
+        }
+        return PreparedChunk(shorts, sampleRate)
+    }
+
+    /** 把整个段落的 PreparedChunk 列表用同一个 AudioTrack 无缝播放 */
+    private suspend fun playParagraph(chunks: List<PreparedChunk>, mySession: Int) {
+        if (chunks.isEmpty()) return
+        val sampleRate = chunks.first().sampleRate
+
+        val minBuf = AudioTrack.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        // 开大缓冲：段落切换时 AudioTrack 还能继续播，给预合成留时间
+        val bufSize = max(minBuf, 65536).coerceAtMost(sampleRate * 2 * 2 /* 最多 2 秒 */)
+
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(bufSize)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+
+        currentTrack = track
+        try {
+            track.play()
+            var written = 0
+            for (chunk in chunks) {
+                if (mySession != session || stopRequested) return
+                // 暂停状态先等，恢复时从当前片段开头播
+                while (paused && mySession == session && !stopRequested) delay(50)
+                if (mySession != session || stopRequested) return
+
+                var off = 0
+                while (off < chunk.samples.size && mySession == session && !stopRequested) {
+                    while (paused && mySession == session && !stopRequested) delay(50)
+                    if (mySession != session || stopRequested) return
+                    val n = track.write(
+                        chunk.samples, off,
+                        min(SAMPLE_CHUNK, chunk.samples.size - off),
+                        AudioTrack.WRITE_BLOCKING
+                    )
+                    if (n <= 0) break
+                    off += n
+                    written += n
+                }
+            }
+            // 等 track 把所有已写入的样本播完
+            while (mySession == session && !stopRequested &&
+                track.playbackHeadPosition < written
+            ) {
+                delay(30)
+            }
+        } catch (e: IllegalStateException) {
+            // 被 stop() 杀掉时 track 可能已释放
+        } finally {
+            if (currentTrack === track) currentTrack = null
+            runCatching { track.stop() }
+            runCatching { track.release() }
+        }
+    }
+
+    private fun clearPrecomputed() {
+        prefetchJob?.cancel()
+        prefetchJob = null
+        precomputed.clear()
+    }
+
+    private fun advance(mySession: Int) {
+        if (mySession != session) return
+        currentIndex++
+        if (currentIndex < paragraphs.size) {
+            startCurrent()
+        } else {
+            finishAll()
+        }
+    }
+
+    private fun finishAll() {
+        clearPrecomputed()
+        speaking = false
+        notify { it.onSpeakingChanged(false) }
+        notify { it.onFinished() }
     }
 
     private fun engineFor(chinese: Boolean): OfflineTts? = when (mode) {
@@ -359,22 +523,6 @@ class TtsManager(private val context: Context) {
         return c in "，。！？；：、“”‘’（）《》〈〉【】…—～·「」『』"
     }
 
-    private fun advance(mySession: Int) {
-        if (mySession != session) return
-        currentIndex++
-        if (currentIndex < paragraphs.size) {
-            startCurrent()
-        } else {
-            finishAll()
-        }
-    }
-
-    private fun finishAll() {
-        speaking = false
-        notify { it.onSpeakingChanged(false) }
-        notify { it.onFinished() }
-    }
-
     /** 把文本切成短句，首句更快出声 */
     private fun splitChunks(text: String): List<String> {
         val sentences = text.split(Regex("(?<=[。！？；!?;\\n])"))
@@ -405,82 +553,8 @@ class TtsManager(private val context: Context) {
         return out.ifEmpty { listOf(text) }
     }
 
-    /** 将合成出的 PCM 浮点数据写入 AudioTrack 播放 */
-    private suspend fun playSamples(samples: FloatArray, sampleRate: Int, mySession: Int) {
-        // 暂停状态下先等待，避免恢复时错过开头
-        while (paused && mySession == session && !stopRequested) delay(50)
-        if (mySession != session || stopRequested) return
-
-        val total = samples.size
-        val shorts = ShortArray(total)
-
-        // 峰值归一：不同模型输出音量差异较大，统一到目标电平
-        var peak = 0f
-        for (i in 0 until total) {
-            val v = abs(samples[i])
-            if (v > peak) peak = v
-        }
-        val gain = if (peak > 0.01f) (TARGET_PEAK / peak).coerceIn(1f, MAX_GAIN) else 1f
-        for (i in 0 until total) {
-            shorts[i] = (samples[i] * gain * 32767f).toInt().coerceIn(-32768, 32767).toShort()
-        }
-
-        val minBuf = AudioTrack.getMinBufferSize(
-            sampleRate,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-        val bufSize = max(minBuf, 16384)
-
-        val track = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build()
-            )
-            .setBufferSizeInBytes(bufSize)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
-
-        currentTrack = track
-        try {
-            track.play()
-            var offset = 0
-            while (offset < total && mySession == session && !stopRequested) {
-                if (paused) {
-                    delay(50)
-                    continue
-                }
-                val n = track.write(
-                    shorts, offset, min(SAMPLE_CHUNK, total - offset), AudioTrack.WRITE_BLOCKING
-                )
-                if (n <= 0) break
-                offset += n
-            }
-            // 等待缓冲区播完
-            while (mySession == session && !stopRequested &&
-                track.playbackHeadPosition < total
-            ) {
-                delay(50)
-            }
-        } catch (e: IllegalStateException) {
-            // 被停止时 track 可能已释放
-        } finally {
-            if (currentTrack === track) currentTrack = null
-            runCatching { track.stop() }
-            runCatching { track.release() }
-        }
-    }
-
     private fun cancelPlayback() {
+        clearPrecomputed()
         stopRequested = true
         job?.cancel()
         job = null
