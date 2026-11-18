@@ -80,6 +80,17 @@ class CacheManager(private val context: Context) {
     fun chunkFile(bookId: String, paraIndex: Int): File =
         File(bookDir(bookId), "%05d.pcm".format(paraIndex))
 
+    /** 进程崩溃/被杀后，残留的 CONVERTING 状态会永远卡住，启动时统一置为 FAILED */
+    fun resetStaleConverting() {
+        runCatching {
+            for (meta in listAll()) {
+                if (meta.status == Status.CONVERTING) {
+                    saveMeta(meta.copy(status = Status.FAILED))
+                }
+            }
+        }
+    }
+
     fun hasChunk(bookId: String, paraIndex: Int): Boolean = chunkFile(bookId, paraIndex).exists()
 
     fun readChunk(bookId: String, paraIndex: Int): ShortArray? {

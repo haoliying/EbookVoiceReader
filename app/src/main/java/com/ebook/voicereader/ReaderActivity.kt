@@ -64,7 +64,7 @@ class ReaderActivity : AppCompatActivity() {
         val fallbackTitle = intent.getStringExtra(EXTRA_FALLBACK_TITLE) ?: ""
 
         lastUri = Uri.parse(uriStr)
-        bookId = bookIdFromIntent ?: CacheManager.idOf("$uriStr:${tts.currentMode().name.lowercase()}")
+        bookId = bookIdFromIntent ?: CacheManager.idOf("$uriStr:${tts.currentMode().name}")
 
         // 如果 tts 正在播放当前这本书，直接刷新 UI 即可
         if (tts.currentBookId() == bookId && (tts.isPlaying() || tts.isPaused())) {
@@ -287,5 +287,12 @@ class ReaderActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent); setIntent(intent)
         intent?.getStringExtra(EXTRA_URI)?.let { loadDocument(Uri.parse(it), intent.getStringExtra(EXTRA_FALLBACK_TITLE) ?: "") }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 从后台返回时重新接管引擎回调
+        setupTtsListener()
+        updatePlayState(tts.isPlaying())
     }
 }

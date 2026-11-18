@@ -219,19 +219,21 @@ class LibraryActivity : AppCompatActivity() {
     }
 
     private fun pickForConvert() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-            != PackageManager.PERMISSION_GRANTED
-        ) requestNotifyPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
-
-        openMultiple.launch(arrayOf(
-            "text/plain", "text/markdown", "application/pdf", "application/epub+zip",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/msword", "image/*", "*/*"
-        ))
+        // 只启动文件选择器；通知权限留到真正开始转换时再申请，
+        // 避免权限弹窗与文件选择器同时打开导致 ActivityResult 竞态闪退。
+        runCatching {
+            openMultiple.launch(arrayOf(
+                "text/plain", "text/markdown", "application/pdf", "application/epub+zip",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/msword", "image/*", "*/*"
+            ))
+        }.onFailure {
+            Toast.makeText(this, R.string.file_open_failed, Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun onPickedForConvert(uris: List<Uri>) {
+        if (isFinishing || isDestroyed) return
         MaterialAlertDialogBuilder(this)
             .setTitle(R.string.convert_pick_mode)
             .setSingleChoiceItems(
@@ -241,7 +243,7 @@ class LibraryActivity : AppCompatActivity() {
                 ), 0
             ) { dialog, which ->
                 val mode = if (which == 1) "chinese" else "mixed"
-                startConvertService(uris, mode)
+                runCatching { startConvertService(uris, mode) }
                 dialog.dismiss()
             }
             .setNegativeButton(R.string.cancel, null)
@@ -249,6 +251,14 @@ class LibraryActivity : AppCompatActivity() {
     }
 
     private fun startConvertService(uris: List<Uri>, mode: String) {
+        // Android 13+ 通知权限：此时文件选择器已关闭，串行申请不会竞态
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            runCatching { requestNotifyPerm.launch(Manifest.permission.POST_NOTIFICATIONS) }
+        }
+
         val names = uris.map { getDisplayName(it) }
         val intent = Intent(this, ConvertService::class.java).apply {
             putExtra(ConvertService.EXTRA_ACTION, ConvertService.ACTION_START)
@@ -256,10 +266,41 @@ class LibraryActivity : AppCompatActivity() {
             putStringArrayListExtra(ConvertService.EXTRA_DISPLAY_NAMES, ArrayList(names))
             putExtra(ConvertService.EXTRA_MODE, mode)
         }
-        runCatching { startForegroundService(intent) }
+        val started = runCatching { startForegroundService(intent) }.isSuccess
+        if (!started) {
+            runCatching { startService(intent) }
+        }
+
+        // 立刻把任务显示在书库里，不等 Service 启动完成
+        ConvertService.registry.registerNewBatch(uris.mapIndexed { i, uri ->
+            TaskInfo(
+                bookId = CacheManager.idOf(uri.toString() + ":" + mode.uppercase()),
+                title = names.getOrNull(i) ?: "文件${i + 1}",
+                uri = uri.toString(),
+                mode = mode,
+                total = 0, done = -1,
+                status = TaskStatus.PENDING,
+                totalSeconds = 0f,
+            )
+        })
+        refreshLibrary()
         Toast.makeText(this, getString(R.string.convert_start) + "（${uris.size} 本）", Toast.LENGTH_LONG).show()
-        // 让新任务立刻出现在列表（服务还没来得及 registerNewBatch，手动触发一次刷新）
-        binding.rvLibrary.postDelayed({ refreshLibrary() }, 500)
+        scheduleRefreshWhileRunning()
+    }
+
+    /** 转换进行中时定时刷新书库，保证进度和"没有显示书"的问题不再出现 */
+    private fun scheduleRefreshWhileRunning() {
+        binding.rvLibrary.removeCallbacks(refreshTick)
+        binding.rvLibrary.postDelayed(refreshTick, 1000)
+    }
+
+    private val refreshTick = object : Runnable {
+        override fun run() {
+            refreshLibrary()
+            if (ConvertService.registry.isRunning()) {
+                binding.rvLibrary.postDelayed(this, 1000)
+            }
+        }
     }
 
     private fun openReader(item: LibraryItem) {
@@ -296,10 +337,8 @@ class LibraryActivity : AppCompatActivity() {
     private fun handleIncoming(intent: Intent?) {
         if (intent?.action == Intent.ACTION_VIEW) {
             intent.data?.let { uri ->
-                openMultiple.launch(arrayOf("*/*")) // ignore
-                // 直接进入阅读器
                 val name = getDisplayName(uri)
-                val id = CacheManager.idOf(uri.toString() + ":" + tts.currentMode().name.lowercase())
+                val id = CacheManager.idOf(uri.toString() + ":" + tts.currentMode().name)
                 openReaderFor(uri, id, name)
             }
         }
@@ -380,12 +419,21 @@ class LibraryActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 从 ReaderActivity 返回时重新接管引擎回调（之前被阅读页覆盖了）
+        setupTtsListener()
+        if (!tts.isReady()) tts.init()
         updatePlayingBar()
         refreshLibrary()
+        if (ConvertService.registry.isRunning()) scheduleRefreshWhileRunning()
+    }
+
+    override fun onPause() {
+        binding.rvLibrary.removeCallbacks(refreshTick)
+        super.onPause()
     }
 
     override fun onDestroy() {
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(convertReceiver)
+        runCatching { LocalBroadcastManager.getInstance(this).unregisterReceiver(convertReceiver) }
         super.onDestroy()
     }
 }

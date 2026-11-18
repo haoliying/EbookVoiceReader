@@ -117,12 +117,19 @@ class TtsManager(private val context: Context) {
     private var currentBookId: String? = null
     private var currentBookTitle: String? = null
 
+    /** 防止重复加载模型（重复加载会因两份模型同时驻留内存导致 OOM 闪退） */
+    @Volatile private var initStarted = false
+
     fun setListener(l: Listener?) { listener = l }
 
     fun setCache(c: CacheManager) { cache = c }
 
-    /** 加载两个引擎（完成后回调 onEngineReady） */
+    /** 加载两个引擎（幂等；重复调用直接忽略） */
     fun init() {
+        synchronized(this) {
+            if (initStarted) return
+            initStarted = true
+        }
         scope.launch {
             var mixedError: String? = null
             var zhError: String? = null

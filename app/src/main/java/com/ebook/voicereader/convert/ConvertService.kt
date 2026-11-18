@@ -11,9 +11,9 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import com.ebook.voicereader.App
 import com.ebook.voicereader.cache.CacheManager
 import com.ebook.voicereader.model.Book
-import com.ebook.voicereader.ocr.OcrEngine
 import com.ebook.voicereader.reader.DocumentReaderFactory
 import com.ebook.voicereader.tts.TtsManager
 import kotlinx.coroutines.CancellationException
@@ -81,11 +81,12 @@ class ConvertService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        cache = CacheManager(this)
-        ttsManager = TtsManager(this)
-        ttsManager.setCache(cache)
-        ttsManager.init()
-        readers = DocumentReaderFactory.create(OcrEngine())
+        // 复用 App 的全局单例：绝不在这里再 new 一个 TtsManager。
+        // 两个 TtsManager 会各加载一份 ~190MB 的 ONNX 模型，低内存设备直接 OOM 闪退。
+        cache = App.instance.cache
+        ttsManager = App.instance.ttsManager
+        ttsManager.init() // 幂等：已加载则直接返回
+        readers = DocumentReaderFactory.create(App.instance.ocrEngine)
         manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         lbm = LocalBroadcastManager.getInstance(this)
         createChannel()
@@ -111,7 +112,12 @@ class ConvertService : Service() {
         val modeStr = intent?.getStringExtra(EXTRA_MODE) ?: "mixed"
         val mode = if (modeStr == "chinese") TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED
 
-        startForeground(NOTIFY_ID, buildNotification("准备中…", "加载语音引擎", 0, 0))
+        // 部分 OEM 在后台限制 FGS，退化为普通 Service，避免直接崩溃
+        runCatching {
+            startForeground(NOTIFY_ID, buildNotification("准备中…", "加载语音引擎", 0, 0))
+        }.onFailure {
+            runCatching { manager?.notify(NOTIFY_ID, buildNotification("准备中…", "加载语音引擎", 0, 0)) }
+        }
 
         // 预先在 registry 里登记所有任务为 PENDING
         registry.registerNewBatch(uris.mapIndexed { i, uri ->
@@ -166,7 +172,7 @@ class ConvertService : Service() {
         cancelState.cancel()
         job?.cancel()
         job = null
-        runCatching { ttsManager.release() }
+        // 注意：不能 release() 共享的 ttsManager，否则会连带卸载正在播放的引擎
         super.onDestroy()
     }
 
