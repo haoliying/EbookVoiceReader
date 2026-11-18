@@ -1,0 +1,134 @@
+package com.ebook.voicereader.reader
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.pdf.PdfRenderer
+import android.net.Uri
+import android.os.ParcelFileDescriptor
+import com.ebook.voicereader.model.Book
+import com.ebook.voicereader.ocr.OcrEngine
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+
+/**
+ * PDF 读取器。
+ * 1) 先用 PdfBox 提取文本层；
+ * 2) 若文本极少（扫描版 PDF），则用 PdfRenderer 逐页渲染为位图，再交给 OCR 识别。
+ */
+class PdfReader(private val ocrEngine: OcrEngine) : DocumentReader {
+
+    override fun supports(extension: String): Boolean = extension == "pdf"
+
+    override suspend fun read(
+        context: Context,
+        uri: Uri,
+        displayName: String,
+        onProgress: (Float) -> Unit
+    ): Book = withContext(Dispatchers.IO) {
+        // 先尝试文本提取
+        var paragraphs = extractText(context, uri)
+        var usedOcr = false
+        onProgress(0.3f)
+
+        // 文本层为空或过少，走 OCR
+        val totalChars = paragraphs.sumOf { it.length }
+        if (totalChars < 50) {
+            val ocrText = extractByOcr(context, uri) { p -> onProgress(0.3f + p * 0.7f) }
+            paragraphs = splitParagraphs(ocrText)
+            usedOcr = true
+        } else {
+            onProgress(1f)
+        }
+
+        Book(
+            title = displayName,
+            paragraphs = paragraphs,
+            sourceFormat = "pdf",
+            usedOcr = usedOcr
+        )
+    }
+
+    private fun extractText(context: Context, uri: Uri): List<String> {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                PDDocument.load(input).use { doc ->
+                    val stripper = PDFTextStripper()
+                    stripper.sortByPosition = true
+                    val text = stripper.getText(doc)
+                    splitParagraphs(text)
+                }
+            } ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * 用 PdfRenderer 渲染每一页为位图并 OCR。
+     */
+    private suspend fun extractByOcr(
+        context: Context,
+        uri: Uri,
+        onProgress: (Float) -> Unit
+    ): String {
+        // 将 Uri 对应的内容复制到临时文件，PdfRenderer 需要 ParcelFileDescriptor
+        val tempFile = File(context.cacheDir, "ocr_${System.currentTimeMillis()}.pdf")
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            FileOutputStream(tempFile).use { output -> input.copyTo(output) }
+        }
+
+        val pfd = ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
+        val result = StringBuilder()
+        PdfRenderer(pfd).use { renderer ->
+            val pageCount = renderer.pageCount
+            for (i in 0 until pageCount) {
+                renderer.openPage(i).use { page ->
+                    val width = page.width.coerceAtMost(1500)
+                    val height = (page.height * (width.toFloat() / page.width)).toInt()
+                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                    val text = ocrEngine.recognize(bitmap)
+                    if (text.isNotBlank()) {
+                        result.append(text).append("\n\n")
+                    }
+                    bitmap.recycle()
+                }
+                onProgress((i + 1).toFloat() / pageCount)
+            }
+        }
+        pfd.close()
+        tempFile.delete()
+        return result.toString()
+    }
+
+    private fun splitParagraphs(text: String): List<String> {
+        if (text.isBlank()) return emptyList()
+        val normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        val blocks = normalized.split(Regex("\\n\\s*\\n"))
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+        val result = mutableListOf<String>()
+        for (block in blocks) {
+            if (block.length <= 300) {
+                result.add(block)
+            } else {
+                val sentences = block.split(Regex("(?<=[。！？!?\\.])")).map { it.trim() }
+                    .filter { it.isNotBlank() }
+                var buf = StringBuilder()
+                for (s in sentences) {
+                    if (buf.length + s.length > 300 && buf.isNotEmpty()) {
+                        result.add(buf.toString().trim())
+                        buf = StringBuilder()
+                    }
+                    buf.append(s)
+                }
+                if (buf.isNotEmpty()) result.add(buf.toString().trim())
+            }
+        }
+        return result
+    }
+}
