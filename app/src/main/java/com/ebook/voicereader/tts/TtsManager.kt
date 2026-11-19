@@ -364,7 +364,9 @@ class TtsManager(private val context: Context) {
             val mySession = session
             prefetchJob?.cancel()
             prefetchJob = scope.launch {
-                prepareLookaheadFrom(idx + 1, prefs.lookaheadSeconds)
+                // 注意：预合成属于当前播放会话，绝对不能自增 session，
+                // 否则正在播放的段落会被判定为过期，导致整本书静音。
+                prepareLookaheadFrom(idx + 1, prefs.lookaheadSeconds, incrementSession = false)
             }
             notify { it.onParagraphStart(idx) }
             val audio = precomputed.remove(idx)
