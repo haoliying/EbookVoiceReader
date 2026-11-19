@@ -25,40 +25,34 @@ import java.util.Locale
  */
 class App : Application() {
 
-    lateinit var cache: CacheManager
-        private set
-    lateinit var prefs: Prefs
-        private set
-    lateinit var ttsManager: TtsManager
-        private set
-    lateinit var ocrEngine: OcrEngine
-        private set
+    /**
+     * 全部改为懒加载：Application.onCreate 只做最轻的事。
+     * 这样即使某个组件初始化有问题，也不会导致“一打开就闪退”。
+     */
+    val cache: CacheManager by lazy {
+        CacheManager(this).also { it.resetStaleConverting() }
+    }
+    val prefs: Prefs by lazy { Prefs(this) }
+    val ocrEngine: OcrEngine by lazy { OcrEngine() }
+    private var ttsCreated = false
+    val ttsManager: TtsManager by lazy {
+        ttsCreated = true
+        TtsManager(this).apply {
+            setCache(cache)
+            setMode(if (prefs.defaultMode == "chinese") TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         instance = this
         installCrashHandler()
-        trace("app:onCreate 开始 · 可用内存 ${availableMemoryMB()} MB")
-
-        cache = CacheManager(this)
-        cache.resetStaleConverting()
-        prefs = Prefs(this)
-        ocrEngine = OcrEngine()
-        // PdfBox 只在真正读取 PDF 时初始化（见 PdfReader），避免启动阶段加载大量类。
-
-        ttsManager = TtsManager(this).apply {
-            setCache(cache)
-            val defaultMode =
-                if (prefs.defaultMode == "chinese") TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED
-            setMode(defaultMode)
-        }
-        trace("app:onCreate 完成")
-        // init() 由 ReaderActivity / ConvertService 按需调用，书库启动不加载模型。
+        runCatching { trace("app:onCreate · 可用内存 ${availableMemoryMB()} MB") }
+        // 其余组件全部懒加载，Application 初始化不再触碰文件、模型或第三方 SDK。
     }
 
     override fun onTerminate() {
-        runCatching { ttsManager.release() }
-        runCatching { ocrEngine.close() }
+        if (ttsCreated) runCatching { ttsManager.release() }
         super.onTerminate()
     }
 
@@ -147,7 +141,9 @@ class App : Application() {
                 trace("crash:${throwable.javaClass.name}: ${throwable.message}")
                 // 关键：启动就崩溃时应用内的诊断页永远打不开，
                 // 所以崩溃时直接把日志写到公共下载目录，用户不打开应用也能发出来。
-                writePublicCrashLog(
+                PublicLog.write(
+                    this,
+                    "朗读时光-崩溃日志.txt",
                     "版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n" +
                         "设备 ${Build.MANUFACTURER} ${Build.MODEL}\n" +
                         "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n" +
@@ -156,27 +152,6 @@ class App : Application() {
                 )
             }
             previous?.uncaughtException(thread, throwable)
-        }
-    }
-
-    /** 把崩溃堆栈写到公共「下载」目录；失败也不影响崩溃流程。 */
-    private fun writePublicCrashLog(text: String) {
-        runCatching {
-            val name = "朗读时光-崩溃日志.txt"
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, name)
-                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
-                }
-                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                if (uri != null) {
-                    contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) }
-                }
-            } else {
-                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                dir.mkdirs()
-                File(dir, name).writeText(text)
-            }
         }
     }
 

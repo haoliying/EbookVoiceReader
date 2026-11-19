@@ -142,7 +142,7 @@ class TtsManager(private val context: Context) {
                 if (mixedEngine == null) {
                     App.traceSafe("tts:开始加载双语模型 · 可用内存 ${App.instance.availableMemoryMB()}MB")
                     try {
-                        mixedEngine = buildEngine(DIR_MIXED)
+                        mixedEngine = buildEngine(DIR_MIXED, 600)
                         App.traceSafe("tts:双语模型加载成功 · 可用内存 ${App.instance.availableMemoryMB()}MB")
                     } catch (e: Throwable) {
                         mixedError = e.message ?: e.javaClass.simpleName
@@ -152,7 +152,7 @@ class TtsManager(private val context: Context) {
                 // 中文模式需要双语模型兜底英文；双语模型不可用时不再浪费内存加载另一套。
                 if (requestedMode == Mode.CHINESE && mixedEngine != null && zhEngine == null) {
                     try {
-                        zhEngine = buildEngine(DIR_ZH)
+                        zhEngine = buildEngine(DIR_ZH, 300)
                         App.traceSafe("tts:中文模型加载成功")
                     } catch (e: Throwable) {
                         zhError = e.message ?: e.javaClass.simpleName
@@ -602,12 +602,22 @@ class TtsManager(private val context: Context) {
         }
     }
 
-    private fun buildEngine(dir: String): OfflineTts {
+    private fun buildEngine(dir: String, minFreeMB: Long): OfflineTts {
         // 双语模型约 170MB，加载时还需要额外的推理内存。
         // 可用内存过低时直接给出可读错误，避免原生层 OOM 直接杀进程（表现为闪退）。
         val avail = runCatching { App.instance.availableMemoryMB() }.getOrDefault(-1L)
-        if (avail in 1 until 300) {
-            throw IllegalStateException("可用内存不足（${avail}MB），请关闭其他应用后重试")
+        if (avail in 1 until minFreeMB) {
+            throw IllegalStateException(
+                "可用内存不足（${avail}MB，加载该语音需要 ${minFreeMB}MB），请关闭其他应用后重试"
+            )
+        }
+        // 先确认资产真的能读出来。缺失/损坏时给中文提示，而不是在原生层直接崩溃。
+        for (name in listOf("model.onnx", "lexicon.txt", "tokens.txt")) {
+            try {
+                context.assets.open("$dir/$name").use { it.read() }
+            } catch (e: Throwable) {
+                throw IllegalStateException("语音模型文件缺失或损坏：$dir/$name", e)
+            }
         }
         val config = OfflineTtsConfig(
             model = OfflineTtsModelConfig(

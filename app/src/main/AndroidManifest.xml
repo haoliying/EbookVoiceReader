@@ -27,6 +27,14 @@
         android:largeHeap="true"
         tools:targetApi="34">
 
+        <!-- 启动探针：在 Application.onCreate 之前记录一次启动痕迹，
+             应用打不开时用户也能从「下载」目录取到崩溃证据。 -->
+        <provider
+            android:name=".StartupProbe"
+            android:authorities="${applicationId}.startup_probe"
+            android:exported="false"
+            android:initOrder="1000" />
+
         <!-- 书库（主入口） -->
         <activity
             android:name=".LibraryActivity"

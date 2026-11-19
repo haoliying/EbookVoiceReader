@@ -207,7 +207,10 @@ class ConvertService : Service() {
                 stopSelf()
             }
         }
-        return START_STICKY
+        // 不用 START_STICKY：进程被系统回收后服务若被悄悄重启，
+        // 重启发生在后台，容易和「打开应用」抢同一时刻，表现为一打开就闪退。
+        // 转换本身可以从 meta 断点继续，用户重新选择本书即可。
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
