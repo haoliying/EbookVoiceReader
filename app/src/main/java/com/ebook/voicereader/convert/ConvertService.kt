@@ -197,6 +197,11 @@ class ConvertService : Service() {
             return START_NOT_STICKY
         }
         val names = intent.getStringArrayListExtra(EXTRA_DISPLAY_NAMES) ?: List(uris.size) { "" }
+        if (uris.isEmpty()) {
+            App.traceSafe("service:uris 为空，结束服务")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         val modeStr = intent.getStringExtra(EXTRA_MODE) ?: "mixed"
         val mode = if (modeStr == "chinese") TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED
         App.traceSafe("service:收到 ${uris.size} 个文件 mode=$modeStr")
