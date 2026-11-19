@@ -85,11 +85,15 @@ class ConvertService : Service() {
         /** 当前真正有转换协程在跑的书籍，用于判断“继续转换”是否需要重新拉起服务。 */
         private val runningBooks = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
+        /** 删除书籍时可立即取消对应协程，不必等当前段合成结束。 */
+        private val bookJobs = ConcurrentHashMap<String, Job>()
+
         fun skipBook(bookId: String) {
             deletedBooks.add(bookId)
             pausedBooks.remove(bookId)
             runningBooks.remove(bookId)
             registry.remove(bookId)
+            bookJobs.remove(bookId)?.cancel()
         }
 
         fun isBookSkipped(bookId: String): Boolean = bookId in deletedBooks
@@ -116,7 +120,6 @@ class ConvertService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val cancelState = CancelState()
-    private val bookJobs = ConcurrentHashMap<String, Job>()
     private val activeJobs = AtomicInteger(0)
 
     /**
@@ -267,6 +270,13 @@ class ConvertService : Service() {
                 App.traceSafe("service:转换异常 ${e.javaClass.name}: $reason")
                 runCatching { failBook(bookId, displayName, uri, mode, reason) }
             } finally {
+                // 删除可能发生在原生合成或解析尚未返回时；最后再清一次，
+                // 确保删除后写回的 PCM/meta 不会把书籍重新带回书架。
+                if (isBookSkipped(bookId)) {
+                    runCatching { cache.deleteBook(bookId) }
+                    registry.remove(bookId)
+                    App.traceSafe("convert:已清理删除任务 $bookId")
+                }
                 runningBooks.remove(bookId)
                 bookJobs.remove(bookId)
                 if (activeJobs.decrementAndGet() == 0) finishBatch()
@@ -365,6 +375,7 @@ class ConvertService : Service() {
             createdAt = existing?.createdAt ?: System.currentTimeMillis(),
             lastPlayedIndex = existing?.lastPlayedIndex ?: -1,
         )
+        if (isBookSkipped(bookId)) return
         cache.saveMeta(meta)
 
         var totalSec = meta.totalSeconds
@@ -375,6 +386,7 @@ class ConvertService : Service() {
 
         // 把当前断点与状态写回 meta，暂停/继续都靠它跨进程恢复。
         fun persist(status: CacheManager.Status) {
+            if (isBookSkipped(bookId)) return
             runCatching {
                 cache.saveMeta(meta.copy(
                     convertedUpTo = done, totalSeconds = totalSec,
@@ -438,6 +450,12 @@ class ConvertService : Service() {
                 continue
             }
             val result = convertSlots.withPermit { ttsManager.synthesizeParagraph(text, mode) }
+            // 原生合成可能耗时数秒，删除往往就发生在这段时间内。
+            // 返回后必须再检查一次，不能把结果写回已删除的书籍目录。
+            if (isBookSkipped(bookId)) {
+                App.traceSafe("convert:合成返回时书籍已删除，丢弃结果 $bookId")
+                return
+            }
             if (result == null) {
                 App.traceSafe("convert:合成返回空 段=$i")
                 failed = true; failReason = "语音合成失败"; break
@@ -480,6 +498,8 @@ class ConvertService : Service() {
         mode: TtsManager.Mode,
         reason: String,
     ) {
+        // 失败回调也可能晚于用户的删除操作，不能借此重建书籍。
+        if (isBookSkipped(bookId)) return
         val current = cache.metaOf(bookId)
         val meta = current?.copy(
             title = title,
@@ -520,6 +540,7 @@ class ConvertService : Service() {
     private fun persistBatchFailure(uris: List<Uri>, mode: TtsManager.Mode, reason: String) {
         for (uri in uris) {
             val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
+            if (isBookSkipped(bookId)) continue
             val meta = cache.metaOf(bookId) ?: continue
             if (meta.status != CacheManager.Status.DONE) {
                 runCatching {

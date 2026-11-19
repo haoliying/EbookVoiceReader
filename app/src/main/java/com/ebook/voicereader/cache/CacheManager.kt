@@ -105,7 +105,11 @@ class CacheManager(private val context: Context) {
         }
     }
 
-    /** 记住上次播放到的段落，下次打开同一本书从该段继续。 */
+    /**
+     * 记住上次播放到的段落，下次打开同一本书从该段继续。
+     * 与 deleteBook 共用实例锁，避免停止播放时的异步写入把刚删除的 meta 写回来。
+     */
+    @Synchronized
     fun updateProgress(bookId: String, index: Int) {
         val meta = metaOf(bookId) ?: return
         if (meta.lastPlayedIndex == index) return
@@ -142,6 +146,7 @@ class CacheManager(private val context: Context) {
         return total / (1024 * 1024)
     }
 
+    @Synchronized
     fun deleteBook(bookId: String) {
         bookDir(bookId).deleteRecursively()
     }
