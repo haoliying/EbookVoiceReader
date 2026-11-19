@@ -21,8 +21,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 
 /**
@@ -72,12 +77,18 @@ class ConvertService : Service() {
          * 用户在书库删除书籍时登记。
          * 正在转换的循环检测到后会立刻放弃这本，避免删掉的目录被重新写回来。
          */
-        private val deletedBooks = java.util.Collections.newSetFromMap(
-            java.util.concurrent.ConcurrentHashMap<String, Boolean>()
-        )
+        private val deletedBooks = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
+        /** 每本书的暂停标记：暂停不取消协程，只在段落之间挂起等待，进度完整保留。 */
+        private val pausedBooks = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
+        /** 当前真正有转换协程在跑的书籍，用于判断“继续转换”是否需要重新拉起服务。 */
+        private val runningBooks = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
         fun skipBook(bookId: String) {
             deletedBooks.add(bookId)
+            pausedBooks.remove(bookId)
+            runningBooks.remove(bookId)
             registry.remove(bookId)
         }
 
@@ -85,11 +96,34 @@ class ConvertService : Service() {
 
         /** 重新转换同一本书时清除删除标记。 */
         fun clearSkip(bookId: String) { deletedBooks.remove(bookId) }
+
+        /** 暂停某本书的转换，已转换的片段与断点全部保留。 */
+        fun pauseBook(bookId: String) {
+            pausedBooks.add(bookId)
+            registry.update(bookId) { it.copy(status = TaskStatus.PAUSED) }
+        }
+
+        /** 继续转换（协程还在时直接续跑，否则由界面重新拉起服务）。 */
+        fun resumeBook(bookId: String) {
+            pausedBooks.remove(bookId)
+            registry.update(bookId) { it.copy(status = TaskStatus.CONVERTING) }
+        }
+
+        fun isBookPaused(bookId: String): Boolean = bookId in pausedBooks
+
+        fun isBookRunning(bookId: String): Boolean = bookId in runningBooks
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var job: Job? = null
     private val cancelState = CancelState()
+    private val bookJobs = ConcurrentHashMap<String, Job>()
+    private val activeJobs = AtomicInteger(0)
+
+    /**
+     * 同时推进的书籍数上限。语音推理本身已被 TtsManager.engineMutex 串行化，
+     * 这里限流主要是避免多本大 PDF 同时解析把内存吃满。
+     */
+    private val convertSlots = Semaphore(2)
 
     private lateinit var cache: CacheManager
     private lateinit var ttsManager: TtsManager
@@ -182,59 +216,72 @@ class ConvertService : Service() {
         ttsManager.init(mode)
         App.traceSafe("service:已请求加载语音引擎")
 
-        job = scope.launch {
+        // 并发转换：每本书一个协程，互不影响。点开正在转换的书可以直接听，
+        // 暂停其中一本也不会拖住其他书。
+        for ((idx, uri) in uris.withIndex()) {
+            val displayName = names.getOrNull(idx) ?: "文件${idx + 1}"
+            launchBook(uri, displayName, mode)
+        }
+
+        // 不用 START_STICKY：进程被系统回收后服务若被悄悄重启，
+        // 重启发生在后台，容易和「打开应用」抢同一时刻，表现为一打开就闪退。
+        // 转换可以从 meta 断点继续，用户重新选择本书或长按继续转换即可。
+        return START_NOT_STICKY
+    }
+
+    /** 为一本书启动独立转换协程。 */
+    private fun launchBook(uri: Uri, displayName: String, mode: TtsManager.Mode) {
+        val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
+        clearSkip(bookId)
+        pausedBooks.remove(bookId)
+        runningBooks.add(bookId)
+        // 同一本书重复点击时先取消旧任务，避免两个协程同时写同一本书。
+        bookJobs.remove(bookId)?.cancel()
+        activeJobs.incrementAndGet()
+
+        bookJobs[bookId] = scope.launch {
             try {
+                // 引擎可能仍在加载，最多等 10 秒。
                 var wait = 0
                 while (!ttsManager.isReady() && wait < 50) {
                     if (cancelState.isCancelled) break
-                    kotlinx.coroutines.delay(200); wait++
+                    delay(200); wait++
                 }
                 App.traceSafe("service:引擎就绪=${ttsManager.isReady()}，等待 ${wait * 200}ms")
                 if (!ttsManager.isReady()) {
-                    val reason = "语音引擎加载失败，请打开书库后重试"
-                    persistBatchFailure(uris, mode, reason)
-                    registry.markAllFailed(reason)
-                    notifyError(reason)
-                    startBroadcast(ACTION_CONVERT_ALL_DONE)
-                    stopSelf(); return@launch
+                    failBook(bookId, displayName, uri, mode, "语音引擎加载失败，请打开书库后重试")
+                    return@launch
                 }
-
-                for ((idx, uri) in uris.withIndex()) {
-                    if (cancelState.isCancelled) break
-                    val displayName = names.getOrNull(idx) ?: "文件${idx + 1}"
-                    App.traceSafe("service:开始转换 [${idx + 1}/${uris.size}] $displayName")
-                    convertOne(uri, displayName, mode, idx, uris.size)
-                    App.traceSafe("service:结束转换 [${idx + 1}/${uris.size}] $displayName")
-                }
-                if (!cancelState.isCancelled) {
-                    notifyDone()
-                }
-                App.traceSafe("service:全部完成")
-                startBroadcast(ACTION_CONVERT_ALL_DONE)
+                App.traceSafe("service:开始转换 $displayName")
+                convertOne(uri, displayName, mode)
+                App.traceSafe("service:结束转换 $displayName")
             } catch (e: CancellationException) {
-                App.traceSafe("service:已取消")
-                startBroadcast(ACTION_CONVERT_ALL_DONE)
+                throw e
             } catch (e: Throwable) {
                 val reason = e.message ?: e.javaClass.simpleName
-                App.traceSafe("service:批处理异常 $reason")
-                persistBatchFailure(uris, mode, reason)
-                registry.markAllFailed(reason)
-                notifyError(reason)
-                startBroadcast(ACTION_CONVERT_ALL_DONE)
+                App.traceSafe("service:转换异常 ${e.javaClass.name}: $reason")
+                runCatching { failBook(bookId, displayName, uri, mode, reason) }
             } finally {
-                stopSelf()
+                runningBooks.remove(bookId)
+                bookJobs.remove(bookId)
+                if (activeJobs.decrementAndGet() == 0) finishBatch()
             }
         }
-        // 不用 START_STICKY：进程被系统回收后服务若被悄悄重启，
-        // 重启发生在后台，容易和「打开应用」抢同一时刻，表现为一打开就闪退。
-        // 转换本身可以从 meta 断点继续，用户重新选择本书即可。
-        return START_NOT_STICKY
+    }
+
+    /** 所有书的协程都结束后收尾。被暂停的书协程仍在等待，不会走到这里。 */
+    private fun finishBatch() {
+        val hasPaused = registry.all().any { it.status == TaskStatus.PAUSED }
+        if (!cancelState.isCancelled && !hasPaused) notifyDone()
+        App.traceSafe("service:全部任务结束 paused=$hasPaused")
+        startBroadcast(ACTION_CONVERT_ALL_DONE)
+        stopSelf()
     }
 
     override fun onDestroy() {
         cancelState.cancel()
-        job?.cancel()
-        job = null
+        bookJobs.values.forEach { it.cancel() }
+        bookJobs.clear()
         // 注意：不能 release() 共享的 ttsManager，否则会连带卸载正在播放的引擎
         super.onDestroy()
     }
@@ -242,8 +289,7 @@ class ConvertService : Service() {
     // ------------------------------------------------------------------
 
     private suspend fun convertOne(
-        uri: Uri, displayName: String, mode: TtsManager.Mode,
-        bookIndex: Int, bookCount: Int
+        uri: Uri, displayName: String, mode: TtsManager.Mode
     ) {
         val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
         // 这是一次新的转换请求，清除这本书之前的删除标记。
@@ -256,7 +302,9 @@ class ConvertService : Service() {
 
         val book: Book = try {
             App.traceSafe("convert:解析开始 $displayName ext=$ext")
-            reader.read(this, uri, displayName) { /* no progress */ }.also {
+            convertSlots.withPermit {
+                reader.read(this, uri, displayName) { /* no progress */ }
+            }.also {
                 App.traceSafe("convert:解析完成 段数=${it.paragraphs.size}")
             }
         } catch (e: CancellationException) {
@@ -281,13 +329,21 @@ class ConvertService : Service() {
         val title = book.title.ifBlank { displayName }
         val total = book.paragraphs.size
 
+        // 继续转换时注册表里可能没有这本书（进程重启后从书库续转），先补一条任务。
+        registry.ensure(
+            TaskInfo(
+                bookId = bookId, title = title, uri = uri.toString(),
+                mode = mode.name.lowercase(), total = total, done = -1,
+                status = TaskStatus.CONVERTING, totalSeconds = 0f,
+            )
+        )
         registry.update(bookId) { it.copy(
             title = title, total = total, status = TaskStatus.CONVERTING,
         ) }
         startBroadcast(ACTION_CONVERT_START, bookId, title, uri, mode.name, -1, total, 0f, null)
 
         val existing = cache.metaOf(bookId)
-        // 已经转换出的片段一律复用：中途崩溃、取消或被系统中断后重新转换，
+        // 已经转换出的片段一律复用：中途崩溃、暂停、取消或被系统中断后重新转换，
         // 都从上次的进度继续，而不是从头再来。
         val startFrom = existing?.let {
             if (it.convertedUpTo >= 0 && it.paragraphCount == total) {
@@ -301,14 +357,26 @@ class ConvertService : Service() {
             sampleRate = existing?.sampleRate ?: 22050, mode = mode.name.lowercase(),
             convertedUpTo = startFrom - 1,
             status = CacheManager.Status.CONVERTING,
-            createdAt = System.currentTimeMillis(),
+            createdAt = existing?.createdAt ?: System.currentTimeMillis(),
+            lastPlayedIndex = existing?.lastPlayedIndex ?: -1,
         )
         cache.saveMeta(meta)
 
         var totalSec = meta.totalSeconds
         var rate = meta.sampleRate
+        var done = startFrom - 1
         var failed = false
         var failReason: String? = null
+
+        // 把当前断点与状态写回 meta，暂停/继续都靠它跨进程恢复。
+        fun persist(status: CacheManager.Status) {
+            runCatching {
+                cache.saveMeta(meta.copy(
+                    convertedUpTo = done, totalSeconds = totalSec,
+                    sampleRate = rate, status = status,
+                ))
+            }
+        }
 
         for (i in startFrom until total) {
             // 用户删除这本书：立刻放弃，保留删除结果。
@@ -317,29 +385,54 @@ class ConvertService : Service() {
                 return
             }
             if (cancelState.isCancelled) {
-                val partial = meta.copy(
-                    status = CacheManager.Status.FAILED, totalSeconds = totalSec,
-                    convertedUpTo = i - 1, sampleRate = rate
-                )
-                cache.saveMeta(partial)
+                persist(CacheManager.Status.PAUSED)
                 registry.update(bookId) { it.copy(
-                    done = i - 1, total = total, status = TaskStatus.CANCELLED,
+                    done = done, total = total, status = TaskStatus.CANCELLED,
                     totalSeconds = totalSec
                 ) }
                 startBroadcast(ACTION_CONVERT_PROGRESS, bookId, title, uri, mode.name,
-                    i - 1, total, totalSec, null)
+                    done, total, totalSec, null, TaskStatus.CANCELLED)
                 return
             }
+
+            // 暂停：不取消协程，只在这里等待，已转换的片段与断点全部保留。
+            if (isBookPaused(bookId)) {
+                persist(CacheManager.Status.PAUSED)
+                registry.update(bookId) { it.copy(
+                    done = done, total = total, status = TaskStatus.PAUSED,
+                    totalSeconds = totalSec
+                ) }
+                startBroadcast(ACTION_CONVERT_PROGRESS, bookId, title, uri, mode.name,
+                    done, total, totalSec, null, TaskStatus.PAUSED)
+                refreshNotification()
+                App.traceSafe("convert:已暂停 $title @${done + 1}/$total")
+                while (isBookPaused(bookId)) {
+                    if (cancelState.isCancelled || isBookSkipped(bookId)) break
+                    delay(300)
+                }
+                if (cancelState.isCancelled) {
+                    registry.update(bookId) { it.copy(status = TaskStatus.CANCELLED) }
+                    return
+                }
+                if (isBookSkipped(bookId)) return
+                persist(CacheManager.Status.CONVERTING)
+                registry.update(bookId) { it.copy(status = TaskStatus.CONVERTING) }
+                refreshNotification()
+                App.traceSafe("convert:继续转换 $title @${done + 1}/$total")
+            }
+
             val text = book.paragraphs[i]
             if (text.isBlank()) {
                 cache.writeChunk(bookId, i, ShortArray(0))
-                cache.saveMeta(meta.copy(convertedUpTo = i))
+                done = i
+                persist(CacheManager.Status.CONVERTING)
                 registry.update(bookId) { it.copy(done = i, total = total, totalSeconds = totalSec) }
                 startBroadcast(ACTION_CONVERT_PROGRESS, bookId, title, uri, mode.name,
                     i, total, totalSec, null)
+                refreshNotification()
                 continue
             }
-            val result = ttsManager.synthesizeParagraph(text, mode)
+            val result = convertSlots.withPermit { ttsManager.synthesizeParagraph(text, mode) }
             if (result == null) {
                 App.traceSafe("convert:合成返回空 段=$i")
                 failed = true; failReason = "语音合成失败"; break
@@ -351,30 +444,23 @@ class ConvertService : Service() {
             rate = r
             totalSec += pcm.size.toFloat() / r
             cache.writeChunk(bookId, i, pcm)
-            cache.saveMeta(meta.copy(convertedUpTo = i, totalSeconds = totalSec, sampleRate = rate))
+            done = i
+            persist(CacheManager.Status.CONVERTING)
 
             registry.update(bookId) { it.copy(done = i, total = total, totalSeconds = totalSec) }
             startBroadcast(ACTION_CONVERT_PROGRESS, bookId, title, uri, mode.name,
                 i, total, totalSec, null)
-
-            val overallDone = (bookIndex * 100f / bookCount) + ((i + 1) * 100f / total / bookCount)
-            updateNotification(
-                "$title · ${i + 1}/$total 段",
-                "总进度 ${overallDone.toInt()}% · 已合成 ${totalSec.toInt()} 秒",
-                i + 1, total
-            )
+            refreshNotification()
         }
 
         if (failed) {
+            persist(CacheManager.Status.FAILED)
             failBook(bookId, title, uri, mode, failReason ?: "语音合成失败")
             return
         }
 
-        val finalMeta = meta.copy(
-            convertedUpTo = total - 1, totalSeconds = totalSec,
-            sampleRate = rate, status = CacheManager.Status.DONE,
-        )
-        cache.saveMeta(finalMeta)
+        done = total - 1
+        persist(CacheManager.Status.DONE)
         registry.update(bookId) { it.copy(
             done = total, total = total, status = TaskStatus.DONE, totalSeconds = totalSec
         ) }
@@ -487,6 +573,26 @@ class ConvertService : Service() {
         runCatching { manager?.notify(NOTIFY_ID, buildNotification(title, text, done, total)) }
     }
 
+    /** 并发转换时通知栏展示汇总进度，而不是被多本书来回覆盖。 */
+    private fun refreshNotification() {
+        val running = registry.all().filter {
+            it.status == TaskStatus.CONVERTING ||
+                it.status == TaskStatus.PAUSED ||
+                it.status == TaskStatus.PENDING
+        }
+        if (running.isEmpty()) return
+        val total = running.sumOf { it.total }
+        val done = running.sumOf { (it.done + 1).coerceAtLeast(0) }
+        val paused = running.count { it.status == TaskStatus.PAUSED }
+        val title = when {
+            paused == running.size -> "转换已暂停"
+            paused > 0 -> "正在转换 ${running.size - paused} 本 · 暂停 $paused 本"
+            else -> "正在转换 ${running.size} 本书"
+        }
+        val text = if (total > 0) "已完成 $done/$total 段" else "正在解析…"
+        updateNotification(title, text, done, total)
+    }
+
     private fun notifyError(message: String) {
         runCatching {
             manager?.notify(NOTIFY_ID,
@@ -523,7 +629,7 @@ class ConvertService : Service() {
 // 共享状态注册表
 // ----------------------------------------------------------------------
 
-enum class TaskStatus { PENDING, CONVERTING, DONE, FAILED, CANCELLED }
+enum class TaskStatus { PENDING, CONVERTING, PAUSED, DONE, FAILED, CANCELLED }
 
 data class TaskInfo(
     val bookId: String,
@@ -539,6 +645,7 @@ data class TaskInfo(
     fun progressText(): String = when (status) {
         TaskStatus.PENDING -> "等待中"
         TaskStatus.CONVERTING -> if (total > 0) "转换中 ${done + 1}/$total" else "解析中…"
+        TaskStatus.PAUSED -> "已暂停 · ${done + 1}/$total 段"
         TaskStatus.DONE -> "已完成 · ${totalSeconds.toInt()} 秒"
         TaskStatus.FAILED -> "失败${message?.let { "：$it" } ?: ""}"
         TaskStatus.CANCELLED -> "已取消 · ${done}/$total 段"
@@ -550,19 +657,27 @@ class StatusRegistry {
 
     fun registerNewBatch(newTasks: List<TaskInfo>) {
         synchronized(tasks) {
-            // 先移除旧的 DONE/FAILED/CANCELLED 任务，保留还在 CONVERTING 的
-            tasks.entries.removeIf { it.value.status != TaskStatus.CONVERTING }
+            // 先移除旧的 DONE/FAILED/CANCELLED 任务，保留还在转换或已暂停的
+            tasks.entries.removeIf {
+                it.value.status != TaskStatus.CONVERTING && it.value.status != TaskStatus.PAUSED
+            }
             for (t in newTasks) tasks[t.bookId] = t
         }
+    }
+
+    /** 从书库续转时注册表里可能没有这本书，补一条任务状态。 */
+    fun ensure(task: TaskInfo) {
+        synchronized(tasks) { tasks.putIfAbsent(task.bookId, task) }
     }
 
     fun all(): List<TaskInfo> = tasks.values.sortedBy {
         when (it.status) {
             TaskStatus.CONVERTING -> 0
-            TaskStatus.PENDING -> 1
-            TaskStatus.DONE -> 2
-            TaskStatus.FAILED -> 3
-            TaskStatus.CANCELLED -> 4
+            TaskStatus.PAUSED -> 1
+            TaskStatus.PENDING -> 2
+            TaskStatus.DONE -> 3
+            TaskStatus.FAILED -> 4
+            TaskStatus.CANCELLED -> 5
         }
     }
 
@@ -597,14 +712,19 @@ class StatusRegistry {
     fun markAllCancelled() {
         synchronized(tasks) {
             tasks.entries.forEach { (k, v) ->
-                if (v.status == TaskStatus.CONVERTING || v.status == TaskStatus.PENDING) {
+                if (v.status == TaskStatus.CONVERTING || v.status == TaskStatus.PENDING ||
+                    v.status == TaskStatus.PAUSED
+                ) {
                     tasks[k] = v.copy(status = TaskStatus.CANCELLED)
                 }
             }
         }
     }
 
-    fun isRunning(): Boolean = tasks.values.any { it.status == TaskStatus.CONVERTING || it.status == TaskStatus.PENDING }
+    fun isRunning(): Boolean = tasks.values.any {
+        it.status == TaskStatus.CONVERTING || it.status == TaskStatus.PENDING ||
+            it.status == TaskStatus.PAUSED
+    }
 
     fun clear() { tasks.clear() }
 }

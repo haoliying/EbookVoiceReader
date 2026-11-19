@@ -49,6 +49,7 @@ class ReaderActivity : AppCompatActivity() {
     private var engineError: String? = null
     private var lastUri: Uri? = null
     private var pendingAutoPlay = false
+    private var seekDragging = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -107,7 +108,16 @@ class ReaderActivity : AppCompatActivity() {
                     binding.tvEngineHint.text = getString(R.string.cache_available_msg, convertedParagraphs)
                 }
             }
-            override fun onParagraphStart(index: Int) { runOnUiThread { highlightParagraph(index) } }
+            override fun onParagraphStart(index: Int) {
+                runOnUiThread {
+                    val total = book?.paragraphs?.size ?: 0
+                    if (total > 0 && !seekDragging) {
+                        binding.seekParagraph.progress = index.coerceIn(0, total - 1)
+                        binding.tvPosition.text = "${index + 1} / $total"
+                    }
+                    highlightParagraph(index)
+                }
+            }
             override fun onSpeakingChanged(speaking: Boolean) { runOnUiThread { updatePlayState(speaking) } }
             override fun onFinished() {
                 runOnUiThread { Toast.makeText(this@ReaderActivity, R.string.finished, Toast.LENGTH_SHORT).show() }
@@ -145,6 +155,25 @@ class ReaderActivity : AppCompatActivity() {
             }
             override fun onStartTrackingTouch(sb: SeekBar?) {}
             override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+
+        binding.seekParagraph.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (fromUser) {
+                    val total = book?.paragraphs?.size ?: 0
+                    if (total > 0) binding.tvPosition.text = "${progress + 1} / $total"
+                }
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) { seekDragging = true }
+            override fun onStopTrackingTouch(sb: SeekBar?) {
+                seekDragging = false
+                val b = book ?: return
+                val total = b.paragraphs.size
+                if (total <= 0) return
+                val target = (sb?.progress ?: 0).coerceIn(0, total - 1)
+                tts.seekTo(target)
+                highlightParagraph(target)
+            }
         })
     }
 
@@ -200,8 +229,19 @@ class ReaderActivity : AppCompatActivity() {
         // 自动开始播放（用户从书库点进来就是想读）
         binding.btnPlayPause.isEnabled = true; binding.btnPlayPause.alpha = 1f
         tts.setCurrentBookTitle(b.title.ifBlank { fallbackTitle })
+
+        // 同步进度条：正在后台播放/暂停时以引擎真实位置为准，否则读取上次记忆的位置。
+        val resumeAt = if (tts.currentBookId() == bookId && (tts.isPlaying() || tts.isPaused())) {
+            tts.currentIndex().coerceIn(0, b.paragraphs.size - 1)
+        } else {
+            startIndexFor(b)
+        }
+        binding.seekParagraph.max = (b.paragraphs.size - 1).coerceAtLeast(0)
+        binding.seekParagraph.progress = resumeAt
+        binding.tvPosition.text = "${resumeAt + 1} / ${b.paragraphs.size}"
+
         if (tts.currentBookId() == bookId && tts.isPlaying()) {
-            // 这本书正在后台播放，接上状态即可，不要从第 0 段重新开始。
+            // 这本书正在后台播放，接上状态即可，不要从上次位置重新开始。
             pendingAutoPlay = false
             updatePlayState(true)
             binding.tvEngineHint.text = getString(R.string.engine_ready_short)
@@ -209,6 +249,15 @@ class ReaderActivity : AppCompatActivity() {
             pendingAutoPlay = true
             togglePlay()
         }
+    }
+
+    /** 上次播放到的段落；没有记录或段落数变化时从第一段开始。 */
+    private fun startIndexFor(b: Book): Int {
+        if (b.paragraphs.isEmpty()) return 0
+        val bid = bookId ?: return 0
+        val meta = cache.metaOf(bid) ?: return 0
+        if (meta.paragraphCount != b.paragraphs.size) return 0
+        return meta.lastPlayedIndex.coerceIn(0, b.paragraphs.size - 1)
     }
 
     private fun togglePlay() {
@@ -235,7 +284,7 @@ class ReaderActivity : AppCompatActivity() {
         else {
             ensureVolume()
             if (isCurrentBook && tts.isPaused()) tts.resume()
-            else tts.speak(b.paragraphs, 0, bookId)
+            else tts.speak(b.paragraphs, startIndexFor(b), bookId)
         }
     }
 

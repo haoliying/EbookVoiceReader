@@ -110,7 +110,7 @@ class LibraryActivity : AppCompatActivity() {
         setupTtsListener()
         adapter = LibraryAdapter(
             onClick = { item -> openReader(item) },
-            onLongClick = { item -> confirmDelete(item) },
+            onLongClick = { item -> showBookActions(item) },
         )
         binding.rvLibrary.layoutManager = GridLayoutManager(this, 2)
         binding.rvLibrary.adapter = adapter
@@ -175,6 +175,74 @@ class LibraryActivity : AppCompatActivity() {
         binding.emptyState.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
     }
 
+    /** 长按书籍卡片：按当前状态提供暂停 / 继续转换 / 删除。 */
+    private fun showBookActions(item: LibraryItem) {
+        val actions = mutableListOf<String>()
+        val handlers = mutableListOf<() -> Unit>()
+        when (item.status) {
+            ItemStatus.CONVERTING -> {
+                actions += "暂停转换"; handlers += { pauseConvert(item) }
+            }
+            ItemStatus.PENDING, ItemStatus.PAUSED, ItemStatus.PARTIAL, ItemStatus.FAILED -> {
+                actions += "继续转换"; handlers += { resumeConvert(item) }
+            }
+            ItemStatus.DONE -> Unit
+        }
+        actions += "删除书籍"; handlers += { confirmDelete(item) }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(item.title)
+            .setItems(actions.toTypedArray()) { _, which -> handlers.getOrNull(which)?.invoke() }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    /** 暂停这本书的转换：已完成片段和断点都保留，随时可继续。 */
+    private fun pauseConvert(item: LibraryItem) {
+        ConvertService.pauseBook(item.bookId)
+        cache.metaOf(item.bookId)?.let {
+            runCatching { cache.saveMeta(it.copy(status = CacheManager.Status.PAUSED)) }
+        }
+        Toast.makeText(this, "已暂停《${item.title}》的转换", Toast.LENGTH_SHORT).show()
+        refreshLibrary()
+    }
+
+    /** 继续转换：协程还在就直接续跑，否则重新拉起服务从中断处继续。 */
+    private fun resumeConvert(item: LibraryItem) {
+        ConvertService.resumeBook(item.bookId)
+        if (ConvertService.isBookRunning(item.bookId)) {
+            refreshLibrary()
+            return
+        }
+        val uri = runCatching { Uri.parse(item.sourceUri) }.getOrNull()
+            ?: run {
+                Toast.makeText(this, "原文件不可用：${item.title}", Toast.LENGTH_LONG).show()
+                return
+            }
+        runCatching {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val mode = if (item.mode.equals("chinese", true)) "chinese" else "mixed"
+        val intent = Intent(this, ConvertService::class.java).apply {
+            putExtra(ConvertService.EXTRA_ACTION, ConvertService.ACTION_START)
+            putParcelableArrayListExtra(ConvertService.EXTRA_URIS, arrayListOf(uri))
+            putStringArrayListExtra(ConvertService.EXTRA_DISPLAY_NAMES, arrayListOf(item.title))
+            putExtra(ConvertService.EXTRA_MODE, mode)
+        }
+        val ok = runCatching { ContextCompat.startForegroundService(this, intent) }.isSuccess ||
+            runCatching { startService(intent) != null }.getOrDefault(false)
+        if (!ok) {
+            ConvertService.registry.update(item.bookId) {
+                it.copy(status = TaskStatus.FAILED, message = "无法启动后台转换")
+            }
+            Toast.makeText(this, "继续转换失败：系统拒绝启动后台服务", Toast.LENGTH_LONG).show()
+        } else {
+            Toast.makeText(this, "正在继续转换《${item.title}》", Toast.LENGTH_SHORT).show()
+            scheduleRefreshWhileRunning()
+        }
+        refreshLibrary()
+    }
+
     /** 长按书籍卡片：确认后删除书籍及其语音缓存。 */
     private fun confirmDelete(item: LibraryItem) {
         MaterialAlertDialogBuilder(this)
@@ -214,6 +282,7 @@ class LibraryActivity : AppCompatActivity() {
                 status = when (meta.status) {
                     CacheManager.Status.DONE -> ItemStatus.DONE
                     CacheManager.Status.CONVERTING -> ItemStatus.CONVERTING
+                    CacheManager.Status.PAUSED -> ItemStatus.PAUSED
                     CacheManager.Status.FAILED -> ItemStatus.FAILED
                     CacheManager.Status.NONE -> ItemStatus.PENDING
                 },
@@ -234,6 +303,7 @@ class LibraryActivity : AppCompatActivity() {
                     errorMessage = task.message ?: existing.errorMessage,
                     status = when (task.status) {
                         TaskStatus.CONVERTING -> ItemStatus.CONVERTING
+                        TaskStatus.PAUSED -> ItemStatus.PAUSED
                         TaskStatus.PENDING -> ItemStatus.PENDING
                         TaskStatus.DONE -> ItemStatus.DONE
                         TaskStatus.FAILED -> ItemStatus.FAILED
@@ -253,6 +323,7 @@ class LibraryActivity : AppCompatActivity() {
                     errorMessage = task.message.orEmpty(),
                     status = when (task.status) {
                         TaskStatus.CONVERTING -> ItemStatus.CONVERTING
+                        TaskStatus.PAUSED -> ItemStatus.PAUSED
                         TaskStatus.PENDING -> ItemStatus.PENDING
                         TaskStatus.DONE -> ItemStatus.DONE
                         TaskStatus.FAILED -> ItemStatus.FAILED
@@ -269,9 +340,10 @@ class LibraryActivity : AppCompatActivity() {
                 when (it.status) {
                     ItemStatus.CONVERTING -> 0
                     ItemStatus.PENDING -> 1
-                    ItemStatus.DONE -> 2
-                    ItemStatus.PARTIAL -> 3
-                    ItemStatus.FAILED -> 4
+                    ItemStatus.PAUSED -> 2
+                    ItemStatus.DONE -> 3
+                    ItemStatus.PARTIAL -> 4
+                    ItemStatus.FAILED -> 5
                 }
             }.thenByDescending { it.createdAt }
         )
@@ -582,7 +654,7 @@ class LibraryActivity : AppCompatActivity() {
 // 类型
 // ----------------------------------------------------------------------
 
-enum class ItemStatus { CONVERTING, PENDING, DONE, PARTIAL, FAILED }
+enum class ItemStatus { CONVERTING, PENDING, PAUSED, DONE, PARTIAL, FAILED }
 
 data class LibraryItem(
     val bookId: String,
@@ -611,6 +683,7 @@ data class LibraryItem(
     fun statusText(): String = when (status) {
         ItemStatus.CONVERTING -> "${percent()}%"
         ItemStatus.PENDING -> "等待中"
+        ItemStatus.PAUSED -> "已暂停 · ${percent()}%"
         ItemStatus.DONE -> App.instance.getString(R.string.library_done)
         ItemStatus.PARTIAL -> "部分 · ${percent()}%"
         ItemStatus.FAILED -> App.instance.getString(R.string.library_failed)
@@ -653,6 +726,7 @@ class LibraryAdapter(
             val badgeColor = when (item.status) {
                 ItemStatus.CONVERTING -> Color.parseColor("#1976D2")
                 ItemStatus.PENDING -> Color.parseColor("#9E9E9E")
+                ItemStatus.PAUSED -> Color.parseColor("#FB8C00")
                 ItemStatus.DONE -> Color.parseColor("#388E3C")
                 ItemStatus.PARTIAL -> Color.parseColor("#F57C00")
                 ItemStatus.FAILED -> Color.parseColor("#D32F2F")
@@ -660,9 +734,11 @@ class LibraryAdapter(
             b.coverStatus.text = item.statusText()
             b.coverStatus.setTextColor(badgeColor)
 
-            if (item.status == ItemStatus.CONVERTING || item.status == ItemStatus.PENDING) {
+            if (item.status == ItemStatus.CONVERTING || item.status == ItemStatus.PENDING ||
+                item.status == ItemStatus.PAUSED
+            ) {
                 b.coverProgress.visibility = View.VISIBLE
-                if (item.status == ItemStatus.CONVERTING && item.paragraphCount > 0) {
+                if (item.paragraphCount > 0) {
                     b.coverProgress.isIndeterminate = false
                     b.coverProgress.progress = item.percent()
                 } else {

@@ -49,6 +49,7 @@ class CacheManager(private val context: Context) {
                 status = Status.valueOf(o.optString("status", "NONE")),
                 createdAt = o.optLong("createdAt", 0L),
                 errorMessage = o.optString("errorMessage", ""),
+                lastPlayedIndex = o.optInt("lastPlayedIndex", -1),
             )
         }.getOrNull()
     }
@@ -66,6 +67,7 @@ class CacheManager(private val context: Context) {
             .put("status", meta.status.name)
             .put("createdAt", meta.createdAt)
             .put("errorMessage", meta.errorMessage)
+            .put("lastPlayedIndex", meta.lastPlayedIndex)
         metaFile(meta.bookId).writeText(o.toString())
     }
 
@@ -81,18 +83,33 @@ class CacheManager(private val context: Context) {
     fun chunkFile(bookId: String, paraIndex: Int): File =
         File(bookDir(bookId), "%05d.pcm".format(paraIndex))
 
-    /** 进程崩溃/被杀后，未完成任务不能永远显示“等待中/转换中”。 */
+    /**
+     * 进程崩溃/被杀后，未完成任务不能永远显示“转换中”。
+     * 统一落成 PAUSED，保留 convertedUpTo，下次长按书籍即可从中断处继续转换。
+     */
     fun resetStaleConverting() {
         runCatching {
             for (meta in listAll()) {
-                if (meta.status == Status.CONVERTING || meta.status == Status.NONE) {
-                    saveMeta(meta.copy(
-                        status = Status.FAILED,
-                        errorMessage = "上次转换被中断，请重新选择本书转换",
+                when (meta.status) {
+                    Status.CONVERTING -> saveMeta(meta.copy(
+                        status = Status.PAUSED,
+                        errorMessage = "上次转换被中断，长按书籍可继续转换",
                     ))
+                    Status.NONE -> saveMeta(meta.copy(
+                        status = Status.PAUSED,
+                        errorMessage = "尚未开始转换，长按书籍可继续转换",
+                    ))
+                    else -> {}
                 }
             }
         }
+    }
+
+    /** 记住上次播放到的段落，下次打开同一本书从该段继续。 */
+    fun updateProgress(bookId: String, index: Int) {
+        val meta = metaOf(bookId) ?: return
+        if (meta.lastPlayedIndex == index) return
+        saveMeta(meta.copy(lastPlayedIndex = index))
     }
 
     fun hasChunk(bookId: String, paraIndex: Int): Boolean = chunkFile(bookId, paraIndex).exists()
@@ -159,7 +176,9 @@ class CacheManager(private val context: Context) {
         val status: Status,
         val createdAt: Long,
         val errorMessage: String = "",
+        /** 上次播放到的段落（-1 = 未播放过） */
+        val lastPlayedIndex: Int = -1,
     )
 
-    enum class Status { NONE, CONVERTING, DONE, FAILED }
+    enum class Status { NONE, CONVERTING, PAUSED, DONE, FAILED }
 }

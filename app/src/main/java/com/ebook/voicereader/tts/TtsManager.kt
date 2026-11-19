@@ -302,10 +302,20 @@ class TtsManager(private val context: Context) {
     fun resume() {
         if (!ready || paragraphs.isEmpty() || !paused) return
         paused = false
+        val active = job
+        if (active != null && active.isActive) {
+            // 普通暂停：播放循环还在，继续写音频即可。
+            speaking = true
+            runCatching { currentTrack?.play() }
+            notify { it.onSpeakingChanged(true) }
+            return
+        }
+        // 播放循环已因拖拽定位 / 切段被取消，需要从当前位置重新起播。
+        stopRequested = false
         speaking = true
-        val track = currentTrack
-        if (track != null) runCatching { track.play() }
+        session++
         notify { it.onSpeakingChanged(true) }
+        launchPlaybackFromCurrent()
     }
 
     fun stop() {
@@ -315,17 +325,19 @@ class TtsManager(private val context: Context) {
         paused = false
         speaking = false
         currentIndex = 0
+        // 停止视为回到开头，下次播放从第一段开始。
+        rememberPosition()
         notify { it.onSpeakingChanged(false) }
     }
 
     fun previous() {
         if (paragraphs.isEmpty()) return
-        jumpTo((currentIndex - 1).coerceAtLeast(0))
+        seekTo((currentIndex - 1).coerceAtLeast(0))
     }
 
     fun next() {
         if (paragraphs.isEmpty()) return
-        jumpTo((currentIndex + 1).coerceAtMost(paragraphs.size - 1))
+        seekTo((currentIndex + 1).coerceAtMost(paragraphs.size - 1))
     }
 
     fun release() {
@@ -347,6 +359,8 @@ class TtsManager(private val context: Context) {
         while (idx in 0 until paraCount) {
             if (stopRequested) return
             val mySession = session
+            currentIndex = idx
+            rememberPosition()
             notify { it.onParagraphStart(idx) }
             // 提前合成后面还没转好的段落，让“边播边转”不出现明显停顿。
             prefetchJob?.cancel()
@@ -391,6 +405,8 @@ class TtsManager(private val context: Context) {
         while (idx in paragraphs.indices) {
             if (stopRequested) return
             val mySession = session
+            currentIndex = idx
+            rememberPosition()
             prefetchJob?.cancel()
             prefetchJob = scope.launch {
                 // 注意：预合成属于当前播放会话，绝对不能自增 session，
@@ -408,31 +424,58 @@ class TtsManager(private val context: Context) {
         finishAll()
     }
 
-    private fun jumpTo(index: Int) {
-        if (!ready) return
-        val wasPlaying = !paused && speaking
+    /**
+     * 跳转到任意段落。
+     * 播放中会立刻从该段继续；暂停时只移动位置，恢复播放时从新位置起播。
+     */
+    fun seekTo(index: Int) {
+        if (!ready || paragraphs.isEmpty()) return
+        val target = index.coerceIn(0, paragraphs.size - 1)
+        val wasPlaying = speaking && !paused
         session++
         cancelPlayback()
         clearPrecomputed()
-        currentIndex = index
+        currentIndex = target
+        rememberPosition()
+        notify { it.onParagraphStart(target) }
         if (wasPlaying) {
             stopRequested = false
             notify { it.onSpeakingChanged(true) }
-            scope.launch {
+            launchPlaybackFromCurrent()
+        }
+    }
+
+    /** 用当前 currentIndex 起播；缓存可用就走缓存，否则实时合成。 */
+    private fun launchPlaybackFromCurrent() {
+        job = scope.launch {
+            try {
                 val bid = currentBookId
                 val meta = bid?.let { cache?.metaOf(it) }
-                if (bid != null && meta != null && meta.status == CacheManager.Status.DONE &&
-                    mode.name.lowercase() == meta.mode
+                if (bid != null && meta != null &&
+                    meta.paragraphCount == paragraphs.size &&
+                    (mode.name.lowercase() == meta.mode || meta.mode.isEmpty())
                 ) {
                     startCachedPlaybackLoop(bid, meta.paragraphCount, meta.sampleRate)
                 } else {
                     prepareLookaheadFrom(currentIndex, prefs.lookaheadSeconds, incrementSession = false)
                     startPlaybackLoop(currentIndex)
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                speaking = false
+                notify { it.onError("朗读出错：${e.message ?: e.javaClass.simpleName}") }
+                notify { it.onSpeakingChanged(false) }
             }
-        } else {
-            notify { it.onParagraphStart(index) }
         }
+    }
+
+    /** 把当前段落写回 meta，下次打开同一本书从该段继续。 */
+    private fun rememberPosition() {
+        val bid = currentBookId ?: return
+        val c = cache ?: return
+        val idx = currentIndex
+        scope.launch { runCatching { c.updateProgress(bid, idx) } }
     }
 
     // ------------------------------------------------------------------
