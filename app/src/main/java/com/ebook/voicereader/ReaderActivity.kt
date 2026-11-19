@@ -68,15 +68,8 @@ class ReaderActivity : AppCompatActivity() {
         lastUri = Uri.parse(uriStr)
         bookId = bookIdFromIntent ?: CacheManager.idOf("$uriStr:${tts.currentMode().name}")
 
-        // 如果 tts 正在播放当前这本书，直接刷新 UI 即可
-        if (tts.currentBookId() == bookId && (tts.isPlaying() || tts.isPaused())) {
-            val cacheMeta = bookId?.let { cache.metaOf(it) }
-            binding.tvTitle.text = cacheMeta?.title ?: fallbackTitle
-            // 没存正文，没法高亮，但可以看到控制状态
-            updatePlayState(tts.isPlaying())
-            return
-        }
-
+        // 注意：即使这本书还在后台播放，也必须重新加载正文。
+        // 否则 book 为 null，再次点播放按钮时 togglePlay 无从下手，看起来就是“不播放”。
         loadDocument(Uri.parse(uriStr), fallbackTitle)
     }
 
@@ -207,14 +200,22 @@ class ReaderActivity : AppCompatActivity() {
         // 自动开始播放（用户从书库点进来就是想读）
         binding.btnPlayPause.isEnabled = true; binding.btnPlayPause.alpha = 1f
         tts.setCurrentBookTitle(b.title.ifBlank { fallbackTitle })
-        pendingAutoPlay = true
-        togglePlay()
+        if (tts.currentBookId() == bookId && tts.isPlaying()) {
+            // 这本书正在后台播放，接上状态即可，不要从第 0 段重新开始。
+            pendingAutoPlay = false
+            updatePlayState(true)
+            binding.tvEngineHint.text = getString(R.string.engine_ready_short)
+        } else {
+            pendingAutoPlay = true
+            togglePlay()
+        }
     }
 
     private fun togglePlay() {
         val b = book ?: run {
-            // 没书但 tts 正在播，说明是"继续播放"进来的 → 直接 resume
+            // 没书：要么正文还在解析，要么是"继续播放"进来的 → 直接 resume
             if (tts.isPaused()) tts.resume()
+            else if (!tts.isPlaying()) Toast.makeText(this, "书籍正在加载，请稍候", Toast.LENGTH_SHORT).show()
             return
         }
         if (b.paragraphs.isEmpty()) {

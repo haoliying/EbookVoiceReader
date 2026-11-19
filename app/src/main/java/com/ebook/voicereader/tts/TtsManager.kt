@@ -248,7 +248,8 @@ class TtsManager(private val context: Context) {
         currentBookId = bookId
 
         val mySession = session
-        scope.launch {
+        App.traceSafe("tts:speak 段数=${all.size} 起始=$startIndex 模式=$mode ready=$ready")
+        job = scope.launch {
             try {
                 // 1) 缓存路径：只要已经有可用片段就直接播，边播边补
                 val cache = cache
@@ -261,6 +262,7 @@ class TtsManager(private val context: Context) {
                     val converted = (0 until all.size).count { cache.hasChunk(bid, it) }
                     // 后台还在转换时也必须复用已转好的部分，不能从头重新合成。
                     if (converted > 0) {
+                        App.traceSafe("tts:走缓存播放 已转=$converted/${all.size} 采样率=${meta.sampleRate}")
                         notify { it.onCacheAvailable(converted) }
                         speaking = true
                         notify { it.onPreparationComplete(converted) }
@@ -271,6 +273,7 @@ class TtsManager(private val context: Context) {
                 }
 
                 // 2) 实时预热路径
+                App.traceSafe("tts:走实时合成 起始=$currentIndex")
                 val warmup = prefs.warmupSeconds
                 val done = prepareWarmup(currentIndex, warmup, mySession)
                 if (mySession != session || stopRequested) return@launch
@@ -582,21 +585,28 @@ class TtsManager(private val context: Context) {
         )
         val bufSize = max(minBuf, 65536).coerceAtMost(sampleRate * 4 /* 最多 4 秒缓冲 */)
 
-        val track = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
-            )
-            .setBufferSizeInBytes(bufSize)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
+        val track = try {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
+                )
+                .setBufferSizeInBytes(bufSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        } catch (e: Throwable) {
+            // 采样率异常或音频资源被占用时，给出可读提示而不是静默无声。
+            App.traceSafe("tts:创建播放器失败 rate=$sampleRate ${e.javaClass.name}: ${e.message}")
+            notify { it.onError("无法创建音频播放器：${e.message ?: e.javaClass.simpleName}") }
+            return
+        }
 
         currentTrack = track
         try {
@@ -622,7 +632,11 @@ class TtsManager(private val context: Context) {
             while (mySession == session && !stopRequested &&
                 track.playbackHeadPosition < written
             ) { delay(30) }
-        } catch (_: IllegalStateException) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            App.traceSafe("tts:写入音频失败 ${e.javaClass.name}: ${e.message}")
+            notify { it.onError("播放失败：${e.message ?: e.javaClass.simpleName}") }
         } finally {
             if (currentTrack === track) currentTrack = null
             runCatching { track.stop() }
