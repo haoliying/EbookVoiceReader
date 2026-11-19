@@ -1,25 +1,21 @@
 package com.ebook.voicereader
 
-import android.Manifest
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.SeekBar
-import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import androidx.core.content.ContextCompat.startForegroundService
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -51,13 +47,10 @@ class LibraryActivity : AppCompatActivity() {
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris -> if (uris.isNotEmpty()) onPickedForConvert(uris.toList()) }
 
-    private val requestNotifyPerm = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { /* 忽略结果，服务会降级 */ }
-
     private val convertReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
-            adapter.refreshAll(buildLibraryList())
+            // 必须同时更新空状态，否则“书库里还没有书”会一直盖住书籍网格。
+            refreshLibrary()
         }
     }
 
@@ -71,7 +64,9 @@ class LibraryActivity : AppCompatActivity() {
         prefs = App.instance.prefs
         tts = App.instance.ttsManager
 
-        binding.tvEngineHint.text = getString(R.string.engine_loading)
+        binding.tvEngineHint.text = getString(
+            if (tts.isReady()) R.string.engine_ready_short else R.string.engine_lazy
+        )
 
         setupViews()
         setupTtsListener()
@@ -89,11 +84,11 @@ class LibraryActivity : AppCompatActivity() {
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(convertReceiver, filter)
 
-        // 引擎未初始化时在后台启动（与 App.onCreate 分离以便拿到 UI 回调）
-        if (!tts.isReady()) tts.init()
-
-        // 检查 incoming ACTION_VIEW（文件管理器直接打开）
+        // 书库只展示数据，不加载大型语音模型；模型在阅读或转换时按需加载。
         handleIncoming(intent)
+        if (intent?.action != Intent.ACTION_VIEW) {
+            binding.root.post { showPendingCrash() }
+        }
     }
 
     private fun setupViews() {
@@ -154,6 +149,7 @@ class LibraryActivity : AppCompatActivity() {
                 convertedUpTo = meta.convertedUpTo,
                 totalSeconds = meta.totalSeconds,
                 mode = meta.mode,
+                errorMessage = meta.errorMessage,
                 status = when (meta.status) {
                     CacheManager.Status.DONE -> ItemStatus.DONE
                     CacheManager.Status.CONVERTING -> ItemStatus.CONVERTING
@@ -174,6 +170,7 @@ class LibraryActivity : AppCompatActivity() {
                     title = task.title.ifBlank { existing.title },
                     totalSeconds = task.totalSeconds.takeIf { it > 0f } ?: existing.totalSeconds,
                     sourceUri = task.uri.ifBlank { existing.sourceUri },
+                    errorMessage = task.message ?: existing.errorMessage,
                     status = when (task.status) {
                         TaskStatus.CONVERTING -> ItemStatus.CONVERTING
                         TaskStatus.PENDING -> ItemStatus.PENDING
@@ -192,6 +189,7 @@ class LibraryActivity : AppCompatActivity() {
                     convertedUpTo = if (task.done >= 0) task.done else -1,
                     totalSeconds = task.totalSeconds,
                     mode = task.mode,
+                    errorMessage = task.message.orEmpty(),
                     status = when (task.status) {
                         TaskStatus.CONVERTING -> ItemStatus.CONVERTING
                         TaskStatus.PENDING -> ItemStatus.PENDING
@@ -243,7 +241,13 @@ class LibraryActivity : AppCompatActivity() {
                 ), 0
             ) { dialog, which ->
                 val mode = if (which == 1) "chinese" else "mixed"
-                runCatching { startConvertService(uris, mode) }
+                runCatching { startConvertService(uris, mode) }.onFailure { error ->
+                    Toast.makeText(
+                        this,
+                        "导入失败：${error.message ?: error.javaClass.simpleName}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
                 dialog.dismiss()
             }
             .setNegativeButton(R.string.cancel, null)
@@ -251,28 +255,8 @@ class LibraryActivity : AppCompatActivity() {
     }
 
     private fun startConvertService(uris: List<Uri>, mode: String) {
-        // Android 13+ 通知权限：此时文件选择器已关闭，串行申请不会竞态
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            runCatching { requestNotifyPerm.launch(Manifest.permission.POST_NOTIFICATIONS) }
-        }
-
         val names = uris.map { getDisplayName(it) }
-        val intent = Intent(this, ConvertService::class.java).apply {
-            putExtra(ConvertService.EXTRA_ACTION, ConvertService.ACTION_START)
-            putParcelableArrayListExtra(ConvertService.EXTRA_URIS, ArrayList(uris))
-            putStringArrayListExtra(ConvertService.EXTRA_DISPLAY_NAMES, ArrayList(names))
-            putExtra(ConvertService.EXTRA_MODE, mode)
-        }
-        val started = runCatching { startForegroundService(intent) }.isSuccess
-        if (!started) {
-            runCatching { startService(intent) }
-        }
-
-        // 立刻把任务显示在书库里，不等 Service 启动完成
-        ConvertService.registry.registerNewBatch(uris.mapIndexed { i, uri ->
+        val tasks = uris.mapIndexed { i, uri ->
             TaskInfo(
                 bookId = CacheManager.idOf(uri.toString() + ":" + mode.uppercase()),
                 title = names.getOrNull(i) ?: "文件${i + 1}",
@@ -282,8 +266,64 @@ class LibraryActivity : AppCompatActivity() {
                 status = TaskStatus.PENDING,
                 totalSeconds = 0f,
             )
-        })
+        }
+
+        // 先持久化书籍，再启动服务。即使服务被系统拒绝或进程随后退出，书库也不会丢书。
+        for ((i, task) in tasks.withIndex()) {
+            val uri = uris[i]
+            if (uri.scheme == "content") {
+                runCatching {
+                    contentResolver.takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
+            }
+            cache.saveMeta(CacheManager.Meta(
+                bookId = task.bookId,
+                sourceUri = task.uri,
+                title = task.title,
+                format = DocumentReaderFactory.extensionOf(this, uri, task.title),
+                paragraphCount = 0,
+                totalSeconds = 0f,
+                sampleRate = 22050,
+                mode = mode,
+                convertedUpTo = -1,
+                status = CacheManager.Status.NONE,
+                createdAt = System.currentTimeMillis(),
+            ))
+        }
+        ConvertService.registry.registerNewBatch(tasks)
         refreshLibrary()
+
+        val intent = Intent(this, ConvertService::class.java).apply {
+            putExtra(ConvertService.EXTRA_ACTION, ConvertService.ACTION_START)
+            putParcelableArrayListExtra(ConvertService.EXTRA_URIS, ArrayList(uris))
+            putStringArrayListExtra(ConvertService.EXTRA_DISPLAY_NAMES, ArrayList(names))
+            putExtra(ConvertService.EXTRA_MODE, mode)
+        }
+        val foregroundAttempt = runCatching { ContextCompat.startForegroundService(this, intent) }
+        val started = foregroundAttempt.isSuccess || runCatching {
+            startService(intent) != null
+        }.getOrDefault(false)
+
+        if (!started) {
+            val reason = foregroundAttempt.exceptionOrNull()?.message ?: "系统拒绝启动后台转换"
+            for (task in tasks) {
+                ConvertService.registry.update(task.bookId) {
+                    it.copy(status = TaskStatus.FAILED, message = reason)
+                }
+                cache.metaOf(task.bookId)?.let { meta ->
+                    cache.saveMeta(meta.copy(
+                        status = CacheManager.Status.FAILED,
+                        errorMessage = reason,
+                    ))
+                }
+            }
+            refreshLibrary()
+            Toast.makeText(this, "后台转换启动失败：$reason", Toast.LENGTH_LONG).show()
+            return
+        }
+
         Toast.makeText(this, getString(R.string.convert_start) + "（${uris.size} 本）", Toast.LENGTH_LONG).show()
         scheduleRefreshWhileRunning()
     }
@@ -358,12 +398,14 @@ class LibraryActivity : AppCompatActivity() {
                 getString(R.string.default_mode_label) + "：" + getString(if (defaultMode == "chinese") R.string.mode_chinese else R.string.mode_mixed),
                 getString(R.string.cache_size_label) + "：${cacheMB} MB",
                 getString(R.string.cache_clean),
+                getString(R.string.diagnostics),
             )) { _, which ->
                 when (which) {
                     0 -> editWarmup()
                     1 -> editLookahead()
                     2 -> editDefaultMode()
                     4 -> cleanCache()
+                    5 -> showDiagnostics()
                 }
             }.setNegativeButton(R.string.cancel, null).show()
     }
@@ -408,20 +450,41 @@ class LibraryActivity : AppCompatActivity() {
             }.setNegativeButton(R.string.cancel, null).show()
     }
 
-    private fun getDisplayName(uri: Uri): String {
-        var name = "document"
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-            if (index >= 0 && cursor.moveToFirst()) name = cursor.getString(index)
-        }
-        return name
+    private fun getDisplayName(uri: Uri): String =
+        DocumentReaderFactory.displayName(this, uri)
+
+    private fun showPendingCrash() {
+        if (isFinishing || isDestroyed) return
+        val report = App.instance.consumeCrashReport() ?: return
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.last_crash_title)
+            .setMessage(getString(R.string.last_crash_message) + "\n\n" + report.takeLast(5000))
+            .setPositiveButton(R.string.copy_diagnostics) { _, _ -> copyDiagnostics(report) }
+            .setNegativeButton(R.string.close, null)
+            .show()
+    }
+
+    private fun showDiagnostics() {
+        val report = App.instance.diagnosticReport()
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.diagnostics)
+            .setMessage(report)
+            .setPositiveButton(R.string.copy_diagnostics) { _, _ -> copyDiagnostics(report) }
+            .setNegativeButton(R.string.close, null)
+            .show()
+    }
+
+    private fun copyDiagnostics(report: String) {
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("朗读时光诊断", report))
+        Toast.makeText(this, R.string.copied, Toast.LENGTH_SHORT).show()
     }
 
     override fun onResume() {
         super.onResume()
         // 从 ReaderActivity 返回时重新接管引擎回调（之前被阅读页覆盖了）
         setupTtsListener()
-        if (!tts.isReady()) tts.init()
+        if (tts.isReady()) binding.tvEngineHint.setText(R.string.engine_ready_short)
         updatePlayingBar()
         refreshLibrary()
         if (ConvertService.registry.isRunning()) scheduleRefreshWhileRunning()
@@ -455,17 +518,22 @@ data class LibraryItem(
     val mode: String,
     val status: ItemStatus,
     val createdAt: Long,
+    val errorMessage: String = "",
 ) {
     fun coverInitial(): String = title.trim().take(1).ifBlank { "?" }
     fun percent(): Int = if (paragraphCount > 0 && convertedUpTo >= 0) ((convertedUpTo + 1) * 100f / paragraphCount).toInt().coerceIn(0, 100) else 0
     fun metaText(): String = buildString {
+        if (status == ItemStatus.FAILED && errorMessage.isNotBlank()) {
+            append(errorMessage)
+            return@buildString
+        }
         if (paragraphCount > 0) append("${paragraphCount} 段")
         if (totalSeconds > 0f) { append(" · ${totalSeconds.toInt()}s") }
         if (mode.isNotBlank()) append(" · ").append(if (mode == "chinese") "中文" else "双语")
     }
     fun statusText(): String = when (status) {
         ItemStatus.CONVERTING -> "${percent()}%"
-        ItemStatus.PENDING -> App.instance.getString(R.string.library_converting)
+        ItemStatus.PENDING -> "等待中"
         ItemStatus.DONE -> App.instance.getString(R.string.library_done)
         ItemStatus.PARTIAL -> "部分 · ${percent()}%"
         ItemStatus.FAILED -> App.instance.getString(R.string.library_failed)
@@ -529,10 +597,3 @@ class LibraryAdapter(private val onClick: (LibraryItem) -> Unit) :
         }
     }
 }
-
-// ----------------------------------------------------------------------
-// 为 LibraryItem.getStringSafe 需要 context — 用 object 代替
-// ----------------------------------------------------------------------
-
-private val contextRef: android.content.Context
-    get() = App.instance

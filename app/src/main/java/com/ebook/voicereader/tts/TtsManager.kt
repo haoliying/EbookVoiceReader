@@ -13,6 +13,7 @@ import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -89,9 +90,16 @@ class TtsManager(private val context: Context) {
         fun durationSec(): Float = samples.size.toFloat() / sampleRate
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, error ->
+            speaking = false
+            notify { it.onError("语音任务出错：${error.message ?: error.javaClass.simpleName}") }
+            notify { it.onSpeakingChanged(false) }
+        }
+    )
     private val engineMutex = Mutex()
+    private val initMutex = Mutex()
 
     private val prefs = Prefs(context)
     private var cache: CacheManager? = null
@@ -117,41 +125,43 @@ class TtsManager(private val context: Context) {
     private var currentBookId: String? = null
     private var currentBookTitle: String? = null
 
-    /** 防止重复加载模型（重复加载会因两份模型同时驻留内存导致 OOM 闪退） */
-    @Volatile private var initStarted = false
-
     fun setListener(l: Listener?) { listener = l }
 
     fun setCache(c: CacheManager) { cache = c }
 
-    /** 加载两个引擎（幂等；重复调用直接忽略） */
-    fun init() {
-        synchronized(this) {
-            if (initStarted) return
-            initStarted = true
-        }
+    /**
+     * 按需加载模型：默认只加载双语模型；中文女声模式才额外加载小雅模型。
+     * initMutex 防止阅读页与转换服务同时重复加载同一模型。
+     */
+    fun init(requestedMode: Mode = mode) {
         scope.launch {
-            var mixedError: String? = null
-            var zhError: String? = null
-            try { mixedEngine = buildEngine(DIR_MIXED) }
-            catch (e: Throwable) { mixedError = e.message ?: e.javaClass.simpleName }
-            try { zhEngine = buildEngine(DIR_ZH) }
-            catch (e: Throwable) { zhError = e.message ?: e.javaClass.simpleName }
-
-            ready = mixedEngine != null || zhEngine != null
-            if (ready) {
-                val info = when {
-                    mixedEngine != null && zhEngine != null ->
-                        "内置离线语音已就绪 · 中英混读 / 中文女声"
-                    mixedEngine != null -> "内置离线语音已就绪 · 仅中英混读"
-                    else -> "内置离线语音已就绪 · 仅中文女声"
+            initMutex.withLock {
+                var mixedError: String? = null
+                var zhError: String? = null
+                if (mixedEngine == null) {
+                    try { mixedEngine = buildEngine(DIR_MIXED) }
+                    catch (e: Throwable) { mixedError = e.message ?: e.javaClass.simpleName }
                 }
-                notify { it.onEngineReady(info) }
-            } else {
-                notify {
-                    it.onEngineUnavailable(
-                        "内置语音引擎加载失败：${mixedError ?: zhError ?: "未知错误"}"
-                    )
+                // 中文模式需要双语模型兜底英文；双语模型不可用时不再浪费内存加载另一套。
+                if (requestedMode == Mode.CHINESE && mixedEngine != null && zhEngine == null) {
+                    try { zhEngine = buildEngine(DIR_ZH) }
+                    catch (e: Throwable) { zhError = e.message ?: e.javaClass.simpleName }
+                }
+
+                ready = mixedEngine != null
+                if (ready) {
+                    val info = if (zhEngine != null) {
+                        "内置离线语音已就绪 · 中英混读 / 中文女声"
+                    } else {
+                        "内置离线语音已就绪 · 中英混读"
+                    }
+                    notify { it.onEngineReady(info) }
+                } else {
+                    notify {
+                        it.onEngineUnavailable(
+                            "内置语音引擎加载失败：${mixedError ?: zhError ?: "未知错误"}"
+                        )
+                    }
                 }
             }
         }
@@ -186,6 +196,8 @@ class TtsManager(private val context: Context) {
     fun setMode(m: Mode) {
         if (m == mode) return
         mode = m
+        // Application 恢复默认模式时不能提前加载模型；只有引擎已启用才补充新模式模型。
+        if (ready) init(m)
         currentBookId = null // 模式变了缓存不可用
         clearPrecomputed()
         if (speaking && ready) {
@@ -427,22 +439,17 @@ class TtsManager(private val context: Context) {
     ): List<PreparedChunk> {
         if (text.isBlank()) return emptyList()
         val out = mutableListOf<PreparedChunk>()
-        val oldMode = mode
-        mode = modeOverride
-        try {
-            for (chunk in splitChunks(text)) {
-                for ((chinese, part) in segmentsOf(chunk)) {
-                    val engine = engineFor(modeOverride, chinese) ?: continue
-                    val audio = engineMutex.withLock {
-                        withContext(Dispatchers.Default) { engine.generate(part, 0, speed) }
-                    }
-                    if (audio.samples.isNotEmpty()) {
-                        out.add(normalize(audio.samples, audio.sampleRate))
-                    }
+        for (chunk in splitChunks(text)) {
+            for ((chinese, part) in segmentsOf(chunk, modeOverride)) {
+                val engine = engineFor(modeOverride, chinese)
+                    ?: throw IllegalStateException("所选语音模式的模型尚未加载")
+                val audio = engineMutex.withLock {
+                    withContext(Dispatchers.Default) { engine.generate(part, 0, speed) }
+                }
+                if (audio.samples.isNotEmpty()) {
+                    out.add(normalize(audio.samples, audio.sampleRate))
                 }
             }
-        } finally {
-            mode = oldMode
         }
         return out
     }
@@ -455,8 +462,8 @@ class TtsManager(private val context: Context) {
         Mode.CHINESE -> if (chinese) zhEngine ?: mixedEngine else mixedEngine
     }
 
-    private fun segmentsOf(chunk: String): List<Pair<Boolean, String>> =
-        if (mode == Mode.MIXED) listOf(false to chunk)
+    private fun segmentsOf(chunk: String, selectedMode: Mode): List<Pair<Boolean, String>> =
+        if (selectedMode == Mode.MIXED) listOf(false to chunk)
         else splitByLanguage(chunk).ifEmpty { listOf(true to chunk) }
 
     private fun splitByLanguage(text: String): List<Pair<Boolean, String>> {

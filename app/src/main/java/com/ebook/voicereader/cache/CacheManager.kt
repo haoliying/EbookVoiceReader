@@ -2,7 +2,6 @@ package com.ebook.voicereader.cache
 
 import android.content.Context
 import android.util.Log
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
@@ -49,6 +48,7 @@ class CacheManager(private val context: Context) {
                 convertedUpTo = o.optInt("convertedUpTo", -1),
                 status = Status.valueOf(o.optString("status", "NONE")),
                 createdAt = o.optLong("createdAt", 0L),
+                errorMessage = o.optString("errorMessage", ""),
             )
         }.getOrNull()
     }
@@ -65,6 +65,7 @@ class CacheManager(private val context: Context) {
             .put("convertedUpTo", meta.convertedUpTo)
             .put("status", meta.status.name)
             .put("createdAt", meta.createdAt)
+            .put("errorMessage", meta.errorMessage)
         metaFile(meta.bookId).writeText(o.toString())
     }
 
@@ -80,12 +81,15 @@ class CacheManager(private val context: Context) {
     fun chunkFile(bookId: String, paraIndex: Int): File =
         File(bookDir(bookId), "%05d.pcm".format(paraIndex))
 
-    /** 进程崩溃/被杀后，残留的 CONVERTING 状态会永远卡住，启动时统一置为 FAILED */
+    /** 进程崩溃/被杀后，未完成任务不能永远显示“等待中/转换中”。 */
     fun resetStaleConverting() {
         runCatching {
             for (meta in listAll()) {
-                if (meta.status == Status.CONVERTING) {
-                    saveMeta(meta.copy(status = Status.FAILED))
+                if (meta.status == Status.CONVERTING || meta.status == Status.NONE) {
+                    saveMeta(meta.copy(
+                        status = Status.FAILED,
+                        errorMessage = "上次转换被中断，请重新选择本书转换",
+                    ))
                 }
             }
         }
@@ -154,6 +158,7 @@ class CacheManager(private val context: Context) {
         val convertedUpTo: Int,
         val status: Status,
         val createdAt: Long,
+        val errorMessage: String = "",
     )
 
     enum class Status { NONE, CONVERTING, DONE, FAILED }

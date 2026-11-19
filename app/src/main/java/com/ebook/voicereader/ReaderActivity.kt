@@ -48,6 +48,7 @@ class ReaderActivity : AppCompatActivity() {
     private var ttsReady = false
     private var engineError: String? = null
     private var lastUri: Uri? = null
+    private var pendingAutoPlay = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -58,6 +59,7 @@ class ReaderActivity : AppCompatActivity() {
 
         setupTtsListener()
         setupViews()
+        tts.init()
 
         val uriStr = intent.getStringExtra(EXTRA_URI) ?: run { finish(); return }
         val bookIdFromIntent = intent.getStringExtra(EXTRA_BOOK_ID)
@@ -82,11 +84,18 @@ class ReaderActivity : AppCompatActivity() {
         tts.setListener(object : TtsManager.Listener {
             override fun onEngineReady(info: String) {
                 ttsReady = true; engineError = null
-                runOnUiThread { binding.tvEngineHint.text = info }
+                runOnUiThread {
+                    binding.tvEngineHint.text = info
+                    if (pendingAutoPlay && book != null) togglePlay()
+                }
             }
             override fun onEngineUnavailable(reason: String) {
-                ttsReady = false; engineError = reason
-                runOnUiThread { binding.tvEngineHint.text = reason }
+                ttsReady = false; engineError = reason; pendingAutoPlay = false
+                runOnUiThread {
+                    binding.tvEngineHint.text = reason
+                    binding.btnPlayPause.isEnabled = true
+                    binding.btnPlayPause.alpha = 1f
+                }
             }
             override fun onPreparationProgress(doneParagraphs: Int, estimatedSeconds: Int) {
                 runOnUiThread {
@@ -148,7 +157,7 @@ class ReaderActivity : AppCompatActivity() {
 
     private fun loadDocument(uri: Uri, fallbackTitle: String) {
         val displayName = getDisplayName(uri)
-        val ext = DocumentReaderFactory.extensionOf(displayName)
+        val ext = DocumentReaderFactory.extensionOf(this, uri, displayName)
         val reader = readers.firstOrNull { it.supports(ext) } ?: run {
             Toast.makeText(this, R.string.file_open_failed, Toast.LENGTH_LONG).show(); finish()
             return
@@ -164,9 +173,13 @@ class ReaderActivity : AppCompatActivity() {
                 }
                 book = b
                 runOnUiThread { showBook(b, fallbackTitle) }
-            } catch (e: Exception) {
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
                 runOnUiThread {
-                    Toast.makeText(this@ReaderActivity, "${getString(R.string.file_open_failed)}: ${e.message}", Toast.LENGTH_LONG).show()
+                    val reason = e.message ?: e.javaClass.simpleName
+                    binding.tvLoading.text = "${getString(R.string.file_open_failed)}：$reason"
+                    Toast.makeText(this@ReaderActivity, "${getString(R.string.file_open_failed)}: $reason", Toast.LENGTH_LONG).show()
                     binding.loadingOverlay.visibility = View.GONE
                 }
             }
@@ -194,6 +207,7 @@ class ReaderActivity : AppCompatActivity() {
         // 自动开始播放（用户从书库点进来就是想读）
         binding.btnPlayPause.isEnabled = true; binding.btnPlayPause.alpha = 1f
         tts.setCurrentBookTitle(b.title.ifBlank { fallbackTitle })
+        pendingAutoPlay = true
         togglePlay()
     }
 
@@ -203,14 +217,23 @@ class ReaderActivity : AppCompatActivity() {
             if (tts.isPaused()) tts.resume()
             return
         }
-        if (b.paragraphs.isEmpty()) { Toast.makeText(this, R.string.empty_content, Toast.LENGTH_SHORT).show(); return }
-        if (!ttsReady) {
-            Toast.makeText(this, engineError ?: getString(R.string.tts_not_ready), Toast.LENGTH_SHORT).show(); return
+        if (b.paragraphs.isEmpty()) {
+            pendingAutoPlay = false
+            Toast.makeText(this, R.string.empty_content, Toast.LENGTH_SHORT).show()
+            return
         }
-        if (isPlaying) tts.pause()
+        if (!ttsReady) {
+            pendingAutoPlay = true
+            binding.tvEngineHint.text = engineError ?: getString(R.string.engine_loading)
+            tts.init()
+            return
+        }
+        pendingAutoPlay = false
+        val isCurrentBook = tts.currentBookId() == bookId
+        if (isPlaying && isCurrentBook) tts.pause()
         else {
             ensureVolume()
-            if (tts.isPaused()) tts.resume()
+            if (isCurrentBook && tts.isPaused()) tts.resume()
             else tts.speak(b.paragraphs, 0, bookId)
         }
     }
@@ -275,14 +298,8 @@ class ReaderActivity : AppCompatActivity() {
         }
     }
 
-    private fun getDisplayName(uri: Uri): String {
-        var name = "document"
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-            if (index >= 0 && cursor.moveToFirst()) name = cursor.getString(index)
-        }
-        return name
-    }
+    private fun getDisplayName(uri: Uri): String =
+        DocumentReaderFactory.displayName(this, uri)
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent); setIntent(intent)

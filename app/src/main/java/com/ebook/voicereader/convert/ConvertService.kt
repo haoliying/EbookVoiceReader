@@ -85,7 +85,6 @@ class ConvertService : Service() {
         // 两个 TtsManager 会各加载一份 ~190MB 的 ONNX 模型，低内存设备直接 OOM 闪退。
         cache = App.instance.cache
         ttsManager = App.instance.ttsManager
-        ttsManager.init() // 幂等：已加载则直接返回
         readers = DocumentReaderFactory.create(App.instance.ocrEngine)
         manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         lbm = LocalBroadcastManager.getInstance(this)
@@ -105,33 +104,33 @@ class ConvertService : Service() {
             }
         }
 
-        val uris = intent?.getParcelableArrayListExtra<Uri>(EXTRA_URIS) ?: run {
+        val uris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent?.getParcelableArrayListExtra(EXTRA_URIS, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent?.getParcelableArrayListExtra<Uri>(EXTRA_URIS)
+        } ?: run {
             stopSelf(); return START_NOT_STICKY
         }
-        val names = intent.getStringArrayListExtra(EXTRA_DISPLAY_NAMES) ?: List(uris.size) { "" }
+        val names = intent?.getStringArrayListExtra(EXTRA_DISPLAY_NAMES) ?: List(uris.size) { "" }
         val modeStr = intent?.getStringExtra(EXTRA_MODE) ?: "mixed"
         val mode = if (modeStr == "chinese") TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED
+        ttsManager.init(mode)
 
-        // 部分 OEM 在后台限制 FGS，退化为普通 Service，避免直接崩溃
-        runCatching {
+        // startForegroundService 后必须成功进入前台态；失败时立即结束服务，
+        // 否则系统会抛出 ForegroundServiceDidNotStartInTimeException 并杀掉整个应用。
+        val foregroundError = runCatching {
             startForeground(NOTIFY_ID, buildNotification("准备中…", "加载语音引擎", 0, 0))
-        }.onFailure {
-            runCatching { manager?.notify(NOTIFY_ID, buildNotification("准备中…", "加载语音引擎", 0, 0)) }
+        }.exceptionOrNull()
+        if (foregroundError != null) {
+            val reason = "后台服务启动失败：${foregroundError.message ?: foregroundError.javaClass.simpleName}"
+            persistBatchFailure(uris, mode, reason)
+            registry.markAllFailed(reason)
+            notifyError(reason)
+            startBroadcast(ACTION_CONVERT_ALL_DONE)
+            stopSelf()
+            return START_NOT_STICKY
         }
-
-        // 预先在 registry 里登记所有任务为 PENDING
-        registry.registerNewBatch(uris.mapIndexed { i, uri ->
-            val displayName = names.getOrNull(i) ?: "文件${i + 1}"
-            TaskInfo(
-                bookId = CacheManager.idOf(uri.toString() + ":" + mode.name),
-                title = displayName,
-                uri = uri.toString(),
-                mode = mode.name.lowercase(),
-                total = 0, done = -1,
-                status = TaskStatus.PENDING,
-                totalSeconds = 0f,
-            )
-        })
 
         job = scope.launch {
             try {
@@ -141,8 +140,10 @@ class ConvertService : Service() {
                     kotlinx.coroutines.delay(200); wait++
                 }
                 if (!ttsManager.isReady()) {
-                    registry.markAllFailed("语音引擎加载失败")
-                    notifyError("语音引擎加载失败")
+                    val reason = "语音引擎加载失败，请打开书库后重试"
+                    persistBatchFailure(uris, mode, reason)
+                    registry.markAllFailed(reason)
+                    notifyError(reason)
                     startBroadcast(ACTION_CONVERT_ALL_DONE)
                     stopSelf(); return@launch
                 }
@@ -159,7 +160,10 @@ class ConvertService : Service() {
             } catch (e: CancellationException) {
                 startBroadcast(ACTION_CONVERT_ALL_DONE)
             } catch (e: Throwable) {
-                notifyError(e.message ?: e.javaClass.simpleName)
+                val reason = e.message ?: e.javaClass.simpleName
+                persistBatchFailure(uris, mode, reason)
+                registry.markAllFailed(reason)
+                notifyError(reason)
                 startBroadcast(ACTION_CONVERT_ALL_DONE)
             } finally {
                 stopSelf()
@@ -182,25 +186,30 @@ class ConvertService : Service() {
         uri: Uri, displayName: String, mode: TtsManager.Mode,
         bookIndex: Int, bookCount: Int
     ) {
-        val ext = DocumentReaderFactory.extensionOf(displayName)
+        val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
+        val ext = DocumentReaderFactory.extensionOf(this, uri, displayName)
         val reader = readers.firstOrNull { it.supports(ext) } ?: run {
-            registry.markFailed(uri, mode.name, displayName)
-            notifyError("不支持的格式：$displayName"); return
+            failBook(bookId, displayName, uri, mode, "不支持的格式：$displayName")
+            return
         }
 
         val book: Book = try {
             reader.read(this, uri, displayName) { /* no progress */ }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
-            registry.markFailed(uri, mode.name, displayName)
-            notifyError("解析失败 $displayName: ${e.message}"); return
-        }
-
-        if (book.paragraphs.isEmpty()) {
-            registry.markFailed(uri, mode.name, "$displayName 没有可朗读的文本")
+            failBook(
+                bookId, displayName, uri, mode,
+                "解析失败：${e.message ?: e.javaClass.simpleName}",
+            )
             return
         }
 
-        val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
+        if (book.paragraphs.isEmpty()) {
+            failBook(bookId, displayName, uri, mode, "没有可朗读的文本")
+            return
+        }
+
         val title = book.title.ifBlank { displayName }
         val total = book.paragraphs.size
 
@@ -276,17 +285,7 @@ class ConvertService : Service() {
         }
 
         if (failed) {
-            val partial = meta.copy(
-                status = CacheManager.Status.FAILED, totalSeconds = totalSec,
-                convertedUpTo = max(0, startFrom - 1), sampleRate = rate
-            )
-            cache.saveMeta(partial)
-            registry.update(bookId) { it.copy(
-                done = max(0, startFrom - 1), total = total,
-                status = TaskStatus.FAILED, totalSeconds = totalSec
-            ) }
-            startBroadcast(ACTION_CONVERT_ERROR, bookId, title, uri, mode.name,
-                max(0, startFrom - 1), total, totalSec, failReason)
+            failBook(bookId, title, uri, mode, failReason ?: "语音合成失败")
             return
         }
 
@@ -300,6 +299,65 @@ class ConvertService : Service() {
         ) }
         startBroadcast(ACTION_CONVERT_DONE, bookId, title, uri, mode.name,
             total, total, totalSec, null)
+    }
+
+    private fun failBook(
+        bookId: String,
+        title: String,
+        uri: Uri,
+        mode: TtsManager.Mode,
+        reason: String,
+    ) {
+        val current = cache.metaOf(bookId)
+        val meta = current?.copy(
+            title = title,
+            status = CacheManager.Status.FAILED,
+            errorMessage = reason,
+        ) ?: CacheManager.Meta(
+            bookId = bookId,
+            sourceUri = uri.toString(),
+            title = title,
+            format = DocumentReaderFactory.extensionOf(this, uri, title),
+            paragraphCount = 0,
+            totalSeconds = 0f,
+            sampleRate = 22050,
+            mode = mode.name.lowercase(),
+            convertedUpTo = -1,
+            status = CacheManager.Status.FAILED,
+            createdAt = System.currentTimeMillis(),
+            errorMessage = reason,
+        )
+        runCatching { cache.saveMeta(meta) }
+        registry.update(bookId) {
+            it.copy(
+                title = title,
+                done = meta.convertedUpTo,
+                total = meta.paragraphCount,
+                totalSeconds = meta.totalSeconds,
+                status = TaskStatus.FAILED,
+                message = reason,
+            )
+        }
+        startBroadcast(
+            ACTION_CONVERT_ERROR, bookId, title, uri, mode.name,
+            meta.convertedUpTo, meta.paragraphCount, meta.totalSeconds, reason,
+        )
+        notifyError("$title：$reason")
+    }
+
+    private fun persistBatchFailure(uris: List<Uri>, mode: TtsManager.Mode, reason: String) {
+        for (uri in uris) {
+            val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
+            val meta = cache.metaOf(bookId) ?: continue
+            if (meta.status != CacheManager.Status.DONE) {
+                runCatching {
+                    cache.saveMeta(meta.copy(
+                        status = CacheManager.Status.FAILED,
+                        errorMessage = reason,
+                    ))
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
