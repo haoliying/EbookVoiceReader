@@ -7,12 +7,14 @@ import android.net.Uri
 import android.os.ParcelFileDescriptor
 import com.ebook.voicereader.model.Book
 import com.ebook.voicereader.ocr.OcrEngine
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * PDF 读取器。
@@ -20,6 +22,17 @@ import java.io.FileOutputStream
  * 2) 若文本极少（扫描版 PDF），则用 PdfRenderer 逐页渲染为位图，再交给 OCR 识别。
  */
 class PdfReader(private val ocrEngine: OcrEngine) : DocumentReader {
+
+    companion object {
+        private val pdfBoxReady = AtomicBoolean(false)
+
+        /** PdfBox 只在真正读 PDF 时初始化，避免拖慢或拖垮应用启动。 */
+        private fun ensurePdfBox(context: Context) {
+            if (pdfBoxReady.compareAndSet(false, true)) {
+                PDFBoxResourceLoader.init(context.applicationContext)
+            }
+        }
+    }
 
     override fun supports(extension: String): Boolean = extension == "pdf"
 
@@ -54,6 +67,7 @@ class PdfReader(private val ocrEngine: OcrEngine) : DocumentReader {
 
     private fun extractText(context: Context, uri: Uri): List<String> {
         return try {
+            ensurePdfBox(context)
             context.contentResolver.openInputStream(uri)?.use { input ->
                 PDDocument.load(input).use { doc ->
                     val stripper = PDFTextStripper()

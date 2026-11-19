@@ -11,8 +11,8 @@ android {
         applicationId = "com.ebook.voicereader"
         minSdk = 24
         targetSdk = 34
-        versionCode = 12
-        versionName = "3.8"
+        versionCode = 13
+        versionName = "3.9"
 
         ndk {
             // sherpa-onnx 内置预编译 so，覆盖主流真机与 x86_64 模拟器

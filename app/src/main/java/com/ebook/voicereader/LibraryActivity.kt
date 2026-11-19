@@ -58,6 +58,44 @@ class LibraryActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 启动阶段任何异常都不能直接闪退：改为展示可读错误和导出入口。
+        try {
+            initLibrary()
+        } catch (e: Throwable) {
+            App.traceSafe("library:onCreate 失败 ${e.javaClass.name}: ${e.message}")
+            runCatching {
+                java.io.File(filesDir, "crash.log").appendText(
+                    "\n===== LibraryActivity.onCreate =====\n" +
+                        android.util.Log.getStackTraceString(e) + "\n"
+                )
+            }
+            showStartupFailure(e)
+        }
+    }
+
+    /** 启动失败时的保底界面：不依赖任何布局资源，一定能显示出来。 */
+    private fun showStartupFailure(e: Throwable) {
+        val detail = "${e.javaClass.name}: ${e.message}"
+        val container = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(48, 64, 48, 48)
+        }
+        val text = android.widget.TextView(this).apply {
+            this.text = "应用启动失败\n\n$detail\n\n请点下方按钮把日志保存到「下载」目录，" +
+                "然后把 朗读时光-诊断日志.txt 发给开发者。"
+            textSize = 15f
+            setTextIsSelectable(true)
+        }
+        val button = android.widget.Button(this).apply {
+            this.text = "保存错误日志到下载目录"
+            setOnClickListener { saveDiagnosticsToDownloads() }
+        }
+        container.addView(text)
+        container.addView(button)
+        setContentView(container)
+    }
+
+    private fun initLibrary() {
         binding = ActivityLibraryBinding.inflate(layoutInflater); setContentView(binding.root)
 
         cache = App.instance.cache
@@ -496,6 +534,8 @@ class LibraryActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 启动失败走保底界面时，binding / tts 尚未初始化，直接跳过。
+        if (!::binding.isInitialized || !::tts.isInitialized) return
         // 从 ReaderActivity 返回时重新接管引擎回调（之前被阅读页覆盖了）
         setupTtsListener()
         if (tts.isReady()) binding.tvEngineHint.setText(R.string.engine_ready_short)
@@ -505,7 +545,7 @@ class LibraryActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
-        binding.rvLibrary.removeCallbacks(refreshTick)
+        if (::binding.isInitialized) binding.rvLibrary.removeCallbacks(refreshTick)
         super.onPause()
     }
 

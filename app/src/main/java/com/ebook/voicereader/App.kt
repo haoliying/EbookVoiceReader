@@ -11,7 +11,6 @@ import com.ebook.voicereader.cache.CacheManager
 import com.ebook.voicereader.cache.Prefs
 import com.ebook.voicereader.ocr.OcrEngine
 import com.ebook.voicereader.tts.TtsManager
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -45,8 +44,7 @@ class App : Application() {
         cache.resetStaleConverting()
         prefs = Prefs(this)
         ocrEngine = OcrEngine()
-        // PdfBox-Android 官方要求在首次读写 PDF 前初始化应用资源。
-        PDFBoxResourceLoader.init(this)
+        // PdfBox 只在真正读取 PDF 时初始化（见 PdfReader），避免启动阶段加载大量类。
 
         ttsManager = TtsManager(this).apply {
             setCache(cache)
@@ -142,15 +140,43 @@ class App : Application() {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             runCatching {
-                val file = File(filesDir, "crash.log")
                 val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(Date())
-                file.appendText(
-                    "\n===== $time [${thread.name}] =====\n" +
-                        Log.getStackTraceString(throwable) + "\n"
-                )
+                val text = "\n===== $time [${thread.name}] =====\n" +
+                    Log.getStackTraceString(throwable) + "\n"
+                File(filesDir, "crash.log").appendText(text)
                 trace("crash:${throwable.javaClass.name}: ${throwable.message}")
+                // 关键：启动就崩溃时应用内的诊断页永远打不开，
+                // 所以崩溃时直接把日志写到公共下载目录，用户不打开应用也能发出来。
+                writePublicCrashLog(
+                    "版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n" +
+                        "设备 ${Build.MANUFACTURER} ${Build.MODEL}\n" +
+                        "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n" +
+                        text + "\n最后运行步骤：\n" +
+                        runCatching { File(filesDir, "trace.log").readText().takeLast(3000) }.getOrDefault("")
+                )
             }
             previous?.uncaughtException(thread, throwable)
+        }
+    }
+
+    /** 把崩溃堆栈写到公共「下载」目录；失败也不影响崩溃流程。 */
+    private fun writePublicCrashLog(text: String) {
+        runCatching {
+            val name = "朗读时光-崩溃日志.txt"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) }
+                }
+            } else {
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                dir.mkdirs()
+                File(dir, name).writeText(text)
+            }
         }
     }
 
