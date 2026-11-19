@@ -67,6 +67,24 @@ class ConvertService : Service() {
 
         /** 所有批量转换任务的共享注册表，Activity 可直接查询 */
         val registry = StatusRegistry()
+
+        /**
+         * 用户在书库删除书籍时登记。
+         * 正在转换的循环检测到后会立刻放弃这本，避免删掉的目录被重新写回来。
+         */
+        private val deletedBooks = java.util.Collections.newSetFromMap(
+            java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+        )
+
+        fun skipBook(bookId: String) {
+            deletedBooks.add(bookId)
+            registry.remove(bookId)
+        }
+
+        fun isBookSkipped(bookId: String): Boolean = bookId in deletedBooks
+
+        /** 重新转换同一本书时清除删除标记。 */
+        fun clearSkip(bookId: String) { deletedBooks.remove(bookId) }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -228,6 +246,8 @@ class ConvertService : Service() {
         bookIndex: Int, bookCount: Int
     ) {
         val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
+        // 这是一次新的转换请求，清除这本书之前的删除标记。
+        clearSkip(bookId)
         val ext = DocumentReaderFactory.extensionOf(this, uri, displayName)
         val reader = readers.firstOrNull { it.supports(ext) } ?: run {
             failBook(bookId, displayName, uri, mode, "不支持的格式：$displayName")
@@ -255,6 +275,9 @@ class ConvertService : Service() {
             return
         }
 
+        // 解析期间用户可能已经删除了这本书，此时不能再写缓存。
+        if (isBookSkipped(bookId)) return
+
         val title = book.title.ifBlank { displayName }
         val total = book.paragraphs.size
 
@@ -264,26 +287,35 @@ class ConvertService : Service() {
         startBroadcast(ACTION_CONVERT_START, bookId, title, uri, mode.name, -1, total, 0f, null)
 
         val existing = cache.metaOf(bookId)
+        // 已经转换出的片段一律复用：中途崩溃、取消或被系统中断后重新转换，
+        // 都从上次的进度继续，而不是从头再来。
         val startFrom = existing?.let {
-            if (it.status == CacheManager.Status.CONVERTING) max(0, it.convertedUpTo + 1) else 0
+            if (it.convertedUpTo >= 0 && it.paragraphCount == total) {
+                max(0, it.convertedUpTo + 1)
+            } else 0
         } ?: 0
 
         val meta = CacheManager.Meta(
             bookId = bookId, sourceUri = uri.toString(), title = title, format = book.sourceFormat,
-            paragraphCount = total, totalSeconds = 0f,
-            sampleRate = 22050, mode = mode.name.lowercase(),
+            paragraphCount = total, totalSeconds = existing?.totalSeconds ?: 0f,
+            sampleRate = existing?.sampleRate ?: 22050, mode = mode.name.lowercase(),
             convertedUpTo = startFrom - 1,
             status = CacheManager.Status.CONVERTING,
             createdAt = System.currentTimeMillis(),
         )
         cache.saveMeta(meta)
 
-        var totalSec = 0f
+        var totalSec = meta.totalSeconds
         var rate = meta.sampleRate
         var failed = false
         var failReason: String? = null
 
         for (i in startFrom until total) {
+            // 用户删除这本书：立刻放弃，保留删除结果。
+            if (isBookSkipped(bookId)) {
+                App.traceSafe("convert:书籍已被删除，中止转换 $bookId")
+                return
+            }
             if (cancelState.isCancelled) {
                 val partial = meta.copy(
                     status = CacheManager.Status.FAILED, totalSeconds = totalSec,
@@ -538,6 +570,11 @@ class StatusRegistry {
         synchronized(tasks) {
             tasks[bookId] = tasks[bookId]?.let { block(it) } ?: return
         }
+    }
+
+    /** 书籍被删除后从列表移除，避免书库里残留一张打不开的卡片。 */
+    fun remove(bookId: String) {
+        synchronized(tasks) { tasks.remove(bookId) }
     }
 
     fun markFailed(uri: Uri, mode: String, reason: String) {

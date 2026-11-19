@@ -250,17 +250,17 @@ class TtsManager(private val context: Context) {
         val mySession = session
         scope.launch {
             try {
-                // 1) 缓存路径：存在缓存就直接播
+                // 1) 缓存路径：只要已经有可用片段就直接播，边播边补
                 val cache = cache
                 val bid = bookId
                 val meta = cache?.metaOf(bid ?: "")
-                if (cache != null && bid != null && meta != null && meta.status == CacheManager.Status.DONE &&
-                    meta.paragraphCount == all.size
+                if (cache != null && bid != null && meta != null &&
+                    meta.paragraphCount == all.size &&
+                    (mode.name.lowercase() == meta.mode || meta.mode.isEmpty())
                 ) {
-                    // 模式不一致时仍实时（不读旧音色缓存）
-                    val modeMatches = mode.name.lowercase() == meta.mode
-                    if (modeMatches || meta.mode.isEmpty()) {
-                        val converted = (0 until all.size).count { cache.hasChunk(bid, it) }
+                    val converted = (0 until all.size).count { cache.hasChunk(bid, it) }
+                    // 后台还在转换时也必须复用已转好的部分，不能从头重新合成。
+                    if (converted > 0) {
                         notify { it.onCacheAvailable(converted) }
                         speaking = true
                         notify { it.onPreparationComplete(converted) }
@@ -344,17 +344,43 @@ class TtsManager(private val context: Context) {
         while (idx in 0 until paraCount) {
             if (stopRequested) return
             val mySession = session
-            val chunk = cache?.readChunk(bookId, idx)
             notify { it.onParagraphStart(idx) }
-            if (chunk != null) {
+            // 提前合成后面还没转好的段落，让“边播边转”不出现明显停顿。
+            prefetchJob?.cancel()
+            prefetchJob = scope.launch { prefetchMissing(bookId, idx + 1, prefs.lookaheadSeconds) }
+            val chunk = cache?.readChunk(bookId, idx)
+            if (chunk != null && chunk.isNotEmpty()) {
                 val dur = chunk.size.toFloat() / sampleRate
                 playRawParagraph(listOf(CacheChunk(chunk, sampleRate)), dur, mySession)
+            } else if (idx < paragraphs.size) {
+                // 后台还没转到这里：先实时合成这一段，播完继续往下走。
+                val audio = precomputed.remove(idx) ?: prepareParagraph(paragraphs[idx], mySession)
+                if (audio.isNotEmpty()) playPreparedParagraph(audio, mySession)
             }
             if (stopRequested) return
             idx++
             currentIndex = idx
         }
         finishAll()
+    }
+
+    /** 只合成尚未落盘的段落，已转换好的直接跳过，避免重复劳动。 */
+    private suspend fun prefetchMissing(bookId: String, fromIndex: Int, targetSeconds: Int) {
+        val mySession = session
+        var seconds = 0f
+        var idx = fromIndex
+        while (idx < paragraphs.size && seconds < targetSeconds) {
+            if (mySession != session || stopRequested) return
+            if (cache?.hasChunk(bookId, idx) != true && !precomputed.containsKey(idx)) {
+                val audio = prepareParagraph(paragraphs[idx], mySession)
+                precomputed[idx] = audio
+                seconds += audio.fold(0f) { a, c -> a + c.durationSec }
+                while (precomputed.size > 5) {
+                    precomputed.entries.firstOrNull()?.let { precomputed.remove(it.key) }
+                }
+            }
+            idx++
+        }
     }
 
     private suspend fun startPlaybackLoop(startIndex: Int) {

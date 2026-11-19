@@ -108,7 +108,10 @@ class LibraryActivity : AppCompatActivity() {
 
         setupViews()
         setupTtsListener()
-        adapter = LibraryAdapter(onClick = { item -> openReader(item) })
+        adapter = LibraryAdapter(
+            onClick = { item -> openReader(item) },
+            onLongClick = { item -> confirmDelete(item) },
+        )
         binding.rvLibrary.layoutManager = GridLayoutManager(this, 2)
         binding.rvLibrary.adapter = adapter
         refreshLibrary()
@@ -170,6 +173,26 @@ class LibraryActivity : AppCompatActivity() {
         val items = buildLibraryList()
         adapter.refreshAll(items)
         binding.emptyState.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+    }
+
+    /** 长按书籍卡片：确认后删除书籍及其语音缓存。 */
+    private fun confirmDelete(item: LibraryItem) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("删除《${item.title}》")
+            .setMessage("会同时删除已转换的语音文件，删除后需要重新转换才能后台朗读。")
+            .setPositiveButton("删除") { _, _ -> deleteBook(item) }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun deleteBook(item: LibraryItem) {
+        // 正在播这本书就先停掉，避免继续读已删除的缓存。
+        if (tts.currentBookId() == item.bookId) tts.stop()
+        // 通知转换服务立刻放弃这本书，防止删掉的目录又被写回来。
+        ConvertService.skipBook(item.bookId)
+        cache.deleteBook(item.bookId)
+        refreshLibrary()
+        Toast.makeText(this, "已删除《${item.title}》", Toast.LENGTH_SHORT).show()
     }
 
     /** 合并 CacheManager 和 ConvertService.registry → 统一展示列表 */
@@ -598,8 +621,10 @@ data class LibraryItem(
 // Adapter
 // ----------------------------------------------------------------------
 
-class LibraryAdapter(private val onClick: (LibraryItem) -> Unit) :
-    RecyclerView.Adapter<LibraryAdapter.VH>() {
+class LibraryAdapter(
+    private val onClick: (LibraryItem) -> Unit,
+    private val onLongClick: (LibraryItem) -> Unit = {},
+) : RecyclerView.Adapter<LibraryAdapter.VH>() {
 
     private var items: List<LibraryItem> = emptyList()
 
@@ -616,11 +641,11 @@ class LibraryAdapter(private val onClick: (LibraryItem) -> Unit) :
     }
 
     override fun onBindViewHolder(holder: VH, position: Int) {
-        holder.bind(items[position], onClick)
+        holder.bind(items[position], onClick, onLongClick)
     }
 
     class VH(private val b: ItemBookCoverBinding) : RecyclerView.ViewHolder(b.root) {
-        fun bind(item: LibraryItem, onClick: (LibraryItem) -> Unit) {
+        fun bind(item: LibraryItem, onClick: (LibraryItem) -> Unit, onLongClick: (LibraryItem) -> Unit) {
             b.coverInitial.text = item.coverInitial()
             b.bookTitle.text = item.title
             b.bookMeta.text = item.metaText()
@@ -648,6 +673,7 @@ class LibraryAdapter(private val onClick: (LibraryItem) -> Unit) :
             }
 
             b.root.setOnClickListener { onClick(item) }
+            b.root.setOnLongClickListener { onLongClick(item); true }
         }
     }
 }
