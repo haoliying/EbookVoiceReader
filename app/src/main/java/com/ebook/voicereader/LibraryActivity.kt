@@ -255,6 +255,7 @@ class LibraryActivity : AppCompatActivity() {
     }
 
     private fun startConvertService(uris: List<Uri>, mode: String) {
+        App.traceSafe("library:选择 ${uris.size} 个文件，模式=$mode")
         val names = uris.map { getDisplayName(it) }
         val tasks = uris.mapIndexed { i, uri ->
             TaskInfo(
@@ -305,6 +306,10 @@ class LibraryActivity : AppCompatActivity() {
         val started = foregroundAttempt.isSuccess || runCatching {
             startService(intent) != null
         }.getOrDefault(false)
+        App.traceSafe(
+            "library:启动服务 started=$started " +
+                "error=${foregroundAttempt.exceptionOrNull()?.javaClass?.simpleName}"
+        )
 
         if (!started) {
             val reason = foregroundAttempt.exceptionOrNull()?.message ?: "系统拒绝启动后台转换"
@@ -460,6 +465,7 @@ class LibraryActivity : AppCompatActivity() {
             .setTitle(R.string.last_crash_title)
             .setMessage(getString(R.string.last_crash_message) + "\n\n" + report.takeLast(5000))
             .setPositiveButton(R.string.copy_diagnostics) { _, _ -> copyDiagnostics(report) }
+            .setNeutralButton(R.string.save_to_downloads) { _, _ -> saveDiagnosticsToDownloads() }
             .setNegativeButton(R.string.close, null)
             .show()
     }
@@ -470,8 +476,16 @@ class LibraryActivity : AppCompatActivity() {
             .setTitle(R.string.diagnostics)
             .setMessage(report)
             .setPositiveButton(R.string.copy_diagnostics) { _, _ -> copyDiagnostics(report) }
+            .setNeutralButton(R.string.save_to_downloads) { _, _ -> saveDiagnosticsToDownloads() }
             .setNegativeButton(R.string.close, null)
             .show()
+    }
+
+    /** 用户不需要 root 或数据线，也能把真实错误发给开发者。 */
+    private fun saveDiagnosticsToDownloads() {
+        val result = runCatching { App.instance.exportDiagnostics() }
+            .getOrElse { "保存失败：${it.message ?: it.javaClass.simpleName}" }
+        Toast.makeText(this, result, Toast.LENGTH_LONG).show()
     }
 
     private fun copyDiagnostics(report: String) {

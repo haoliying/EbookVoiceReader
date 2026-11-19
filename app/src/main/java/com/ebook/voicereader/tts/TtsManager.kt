@@ -6,6 +6,7 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Handler
 import android.os.Looper
+import com.ebook.voicereader.App
 import com.ebook.voicereader.cache.CacheManager
 import com.ebook.voicereader.cache.Prefs
 import com.k2fsa.sherpa.onnx.OfflineTts
@@ -139,13 +140,24 @@ class TtsManager(private val context: Context) {
                 var mixedError: String? = null
                 var zhError: String? = null
                 if (mixedEngine == null) {
-                    try { mixedEngine = buildEngine(DIR_MIXED) }
-                    catch (e: Throwable) { mixedError = e.message ?: e.javaClass.simpleName }
+                    App.traceSafe("tts:开始加载双语模型 · 可用内存 ${App.instance.availableMemoryMB()}MB")
+                    try {
+                        mixedEngine = buildEngine(DIR_MIXED)
+                        App.traceSafe("tts:双语模型加载成功 · 可用内存 ${App.instance.availableMemoryMB()}MB")
+                    } catch (e: Throwable) {
+                        mixedError = e.message ?: e.javaClass.simpleName
+                        App.traceSafe("tts:双语模型加载失败 ${e.javaClass.name}: ${e.message}")
+                    }
                 }
                 // 中文模式需要双语模型兜底英文；双语模型不可用时不再浪费内存加载另一套。
                 if (requestedMode == Mode.CHINESE && mixedEngine != null && zhEngine == null) {
-                    try { zhEngine = buildEngine(DIR_ZH) }
-                    catch (e: Throwable) { zhError = e.message ?: e.javaClass.simpleName }
+                    try {
+                        zhEngine = buildEngine(DIR_ZH)
+                        App.traceSafe("tts:中文模型加载成功")
+                    } catch (e: Throwable) {
+                        zhError = e.message ?: e.javaClass.simpleName
+                        App.traceSafe("tts:中文模型加载失败 ${e.javaClass.name}: ${e.message}")
+                    }
                 }
 
                 ready = mixedEngine != null
@@ -591,6 +603,12 @@ class TtsManager(private val context: Context) {
     }
 
     private fun buildEngine(dir: String): OfflineTts {
+        // 双语模型约 170MB，加载时还需要额外的推理内存。
+        // 可用内存过低时直接给出可读错误，避免原生层 OOM 直接杀进程（表现为闪退）。
+        val avail = runCatching { App.instance.availableMemoryMB() }.getOrDefault(-1L)
+        if (avail in 1 until 300) {
+            throw IllegalStateException("可用内存不足（${avail}MB），请关闭其他应用后重试")
+        }
         val config = OfflineTtsConfig(
             model = OfflineTtsModelConfig(
                 vits = OfflineTtsVitsModelConfig(

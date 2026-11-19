@@ -94,36 +94,64 @@ class ConvertService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.getStringExtra(EXTRA_ACTION)) {
-            ACTION_CANCEL -> {
-                cancelState.cancel()
-                registry.markAllCancelled()
-                startBroadcast(ACTION_CONVERT_ALL_DONE)
-                stopSelf()
-                return START_NOT_STICKY
-            }
-        }
-
-        val uris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent?.getParcelableArrayListExtra(EXTRA_URIS, Uri::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent?.getParcelableArrayListExtra<Uri>(EXTRA_URIS)
-        } ?: run {
-            stopSelf(); return START_NOT_STICKY
-        }
-        val names = intent?.getStringArrayListExtra(EXTRA_DISPLAY_NAMES) ?: List(uris.size) { "" }
-        val modeStr = intent?.getStringExtra(EXTRA_MODE) ?: "mixed"
-        val mode = if (modeStr == "chinese") TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED
-        ttsManager.init(mode)
-
-        // startForegroundService 后必须成功进入前台态；失败时立即结束服务，
-        // 否则系统会抛出 ForegroundServiceDidNotStartInTimeException 并杀掉整个应用。
+        // 第一件事就是进入前台态：Android 12+ 如果 5 秒内没进入，
+        // 系统会抛 ForegroundServiceDidNotStartInTimeException 并杀掉整个应用。
         val foregroundError = runCatching {
             startForeground(NOTIFY_ID, buildNotification("准备中…", "加载语音引擎", 0, 0))
         }.exceptionOrNull()
+        App.traceSafe(
+            "service:onStartCommand action=${intent?.getStringExtra(EXTRA_ACTION)} " +
+                "foreground=${foregroundError == null} 可用内存=${App.instance.availableMemoryMB()}MB"
+        )
+
+        // 进程被系统重建时可能拿不到原始 Intent，此时没有任务可做。
+        if (intent == null) {
+            App.traceSafe("service:intent=null，结束服务")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        return try {
+            handleStart(intent, foregroundError)
+        } catch (e: Throwable) {
+            // 服务运行在主线程，任何抛出都会直接杀死整个应用；这里统一兜住并留下轨迹。
+            val reason = "后台服务异常：${e.message ?: e.javaClass.simpleName}"
+            App.traceSafe("service:未捕获异常 $reason")
+            runCatching { registry.markAllFailed(reason) }
+            runCatching { notifyError(reason) }
+            runCatching { startBroadcast(ACTION_CONVERT_ALL_DONE) }
+            runCatching { stopSelf() }
+            START_NOT_STICKY
+        }
+    }
+
+    private fun handleStart(intent: Intent, foregroundError: Throwable?): Int {
+        if (intent.getStringExtra(EXTRA_ACTION) == ACTION_CANCEL) {
+            cancelState.cancel()
+            registry.markAllCancelled()
+            startBroadcast(ACTION_CONVERT_ALL_DONE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val uris: List<Uri> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableArrayListExtra(EXTRA_URIS, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableArrayListExtra<Uri>(EXTRA_URIS)
+        } ?: run {
+            App.traceSafe("service:没有 uris，结束服务")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val names = intent.getStringArrayListExtra(EXTRA_DISPLAY_NAMES) ?: List(uris.size) { "" }
+        val modeStr = intent.getStringExtra(EXTRA_MODE) ?: "mixed"
+        val mode = if (modeStr == "chinese") TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED
+        App.traceSafe("service:收到 ${uris.size} 个文件 mode=$modeStr")
+
         if (foregroundError != null) {
             val reason = "后台服务启动失败：${foregroundError.message ?: foregroundError.javaClass.simpleName}"
+            App.traceSafe("service:startForeground 失败 $reason")
             persistBatchFailure(uris, mode, reason)
             registry.markAllFailed(reason)
             notifyError(reason)
@@ -132,6 +160,10 @@ class ConvertService : Service() {
             return START_NOT_STICKY
         }
 
+        // 引擎在 IO 线程加载，不在主线程阻塞。
+        ttsManager.init(mode)
+        App.traceSafe("service:已请求加载语音引擎")
+
         job = scope.launch {
             try {
                 var wait = 0
@@ -139,6 +171,7 @@ class ConvertService : Service() {
                     if (cancelState.isCancelled) break
                     kotlinx.coroutines.delay(200); wait++
                 }
+                App.traceSafe("service:引擎就绪=${ttsManager.isReady()}，等待 ${wait * 200}ms")
                 if (!ttsManager.isReady()) {
                     val reason = "语音引擎加载失败，请打开书库后重试"
                     persistBatchFailure(uris, mode, reason)
@@ -151,16 +184,21 @@ class ConvertService : Service() {
                 for ((idx, uri) in uris.withIndex()) {
                     if (cancelState.isCancelled) break
                     val displayName = names.getOrNull(idx) ?: "文件${idx + 1}"
+                    App.traceSafe("service:开始转换 [${idx + 1}/${uris.size}] $displayName")
                     convertOne(uri, displayName, mode, idx, uris.size)
+                    App.traceSafe("service:结束转换 [${idx + 1}/${uris.size}] $displayName")
                 }
                 if (!cancelState.isCancelled) {
                     notifyDone()
                 }
+                App.traceSafe("service:全部完成")
                 startBroadcast(ACTION_CONVERT_ALL_DONE)
             } catch (e: CancellationException) {
+                App.traceSafe("service:已取消")
                 startBroadcast(ACTION_CONVERT_ALL_DONE)
             } catch (e: Throwable) {
                 val reason = e.message ?: e.javaClass.simpleName
+                App.traceSafe("service:批处理异常 $reason")
                 persistBatchFailure(uris, mode, reason)
                 registry.markAllFailed(reason)
                 notifyError(reason)
@@ -194,10 +232,14 @@ class ConvertService : Service() {
         }
 
         val book: Book = try {
-            reader.read(this, uri, displayName) { /* no progress */ }
+            App.traceSafe("convert:解析开始 $displayName ext=$ext")
+            reader.read(this, uri, displayName) { /* no progress */ }.also {
+                App.traceSafe("convert:解析完成 段数=${it.paragraphs.size}")
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
+            App.traceSafe("convert:解析失败 ${e.javaClass.name}: ${e.message}")
             failBook(
                 bookId, displayName, uri, mode,
                 "解析失败：${e.message ?: e.javaClass.simpleName}",
@@ -264,7 +306,11 @@ class ConvertService : Service() {
             }
             val result = ttsManager.synthesizeParagraph(text, mode)
             if (result == null) {
+                App.traceSafe("convert:合成返回空 段=$i")
                 failed = true; failReason = "语音合成失败"; break
+            }
+            if (i < 3 || i % 20 == 0) {
+                App.traceSafe("convert:合成第 $i 段完成 · 可用内存 ${App.instance.availableMemoryMB()}MB")
             }
             val (pcm, r) = result
             rate = r

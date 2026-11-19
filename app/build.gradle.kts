@@ -11,8 +11,8 @@ android {
         applicationId = "com.ebook.voicereader"
         minSdk = 24
         targetSdk = 34
-        versionCode = 11
-        versionName = "3.7"
+        versionCode = 12
+        versionName = "3.8"
 
         ndk {
             // sherpa-onnx 内置预编译 so，覆盖主流真机与 x86_64 模拟器
@@ -20,8 +20,22 @@ android {
         }
     }
 
+    signingConfigs {
+        // 固定签名，保证后续版本可以直接覆盖升级，不需要每次卸载重装。
+        create("stable") {
+            storeFile = file("../keystore/ebook-release.jks")
+            storePassword = "ebookreader2024"
+            keyAlias = "ebook"
+            keyPassword = "ebookreader2024"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("stable")
+        }
         release {
+            signingConfig = signingConfigs.getByName("stable")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
