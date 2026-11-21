@@ -31,6 +31,7 @@ import com.ebook.voicereader.databinding.ItemBookCoverBinding
 import com.ebook.voicereader.reader.DocumentReaderFactory
 import com.ebook.voicereader.tts.TtsManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlin.math.roundToInt
 
 /**
  * Launcher: 书库网格。
@@ -137,12 +138,80 @@ class LibraryActivity : AppCompatActivity() {
     }
 
     private fun setupViews() {
-        binding.btnPickConvert.setOnClickListener { pickForConvert() }
-        binding.btnSettings.setOnClickListener { showSettings() }
+        binding.fabImport.setOnClickListener { pickForConvert() }
         binding.btnResumePlay.setOnClickListener {
             val current = tts.currentBookId()
             if (current != null) openReaderByBookId(current)
         }
+        setupSettingsPanel()
+        binding.bottomNav.setOnItemSelectedListener { item ->
+            when (item.itemId) {
+                R.id.nav_settings -> {
+                    binding.settingsPage.visibility = View.VISIBLE
+                    binding.rvLibrary.visibility = View.GONE
+                    binding.emptyState.visibility = View.GONE
+                    binding.fabImport.visibility = View.GONE
+                    updateSettingsValues()
+                    true
+                }
+                else -> {
+                    binding.settingsPage.visibility = View.GONE
+                    binding.fabImport.visibility = View.VISIBLE
+                    refreshLibrary()
+                    true
+                }
+            }
+        }
+    }
+
+    /** 设置页上的控件直接修改并持久化参数，不再只是展示只读列表。 */
+    private fun setupSettingsPanel() {
+        val isChinese = prefs.defaultMode != "mixed"
+        binding.radioChinese.isChecked = isChinese
+        binding.radioMixed.isChecked = !isChinese
+        binding.radioGroupMode.setOnCheckedChangeListener { _, id ->
+            val mode = if (id == R.id.radioMixed) "mixed" else "chinese"
+            if (mode == prefs.defaultMode) return@setOnCheckedChangeListener
+            prefs.defaultMode = mode
+            if (!tts.isPlaying()) {
+                tts.setMode(
+                    if (mode == "chinese") TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED
+                )
+            }
+        }
+
+        binding.sliderWarmup.value = snapSlider(prefs.warmupSeconds, 5, 5)
+        binding.tvWarmupValue.text = "${prefs.warmupSeconds} 秒"
+        binding.sliderWarmup.addOnChangeListener { _, value, fromUser ->
+            if (!fromUser) return@addOnChangeListener
+            prefs.warmupSeconds = value.toInt()
+            binding.tvWarmupValue.text = "${value.toInt()} 秒"
+        }
+
+        binding.sliderLookahead.value = snapSlider(prefs.lookaheadSeconds, 10, 10)
+        binding.tvLookaheadValue.text = "${prefs.lookaheadSeconds} 秒"
+        binding.sliderLookahead.addOnChangeListener { _, value, fromUser ->
+            if (!fromUser) return@addOnChangeListener
+            prefs.lookaheadSeconds = value.toInt()
+            binding.tvLookaheadValue.text = "${value.toInt()} 秒"
+        }
+
+        binding.btnCleanCache.setOnClickListener { cleanCache() }
+        binding.btnDiagnostics.setOnClickListener { showDiagnostics() }
+    }
+
+    /** Slider 的值必须落在 valueFrom + n * stepSize 上，否则会抛异常。 */
+    private fun snapSlider(value: Int, from: Int, step: Int): Float {
+        val steps = ((value - from).toFloat() / step).roundToInt()
+        return (from + steps * step).toFloat()
+    }
+
+    private fun updateSettingsValues() {
+        binding.tvCacheSize.text = getString(R.string.settings_cache_usage, cache.totalSizeMB())
+        binding.radioChinese.isChecked = prefs.defaultMode != "mixed"
+        binding.radioMixed.isChecked = prefs.defaultMode == "mixed"
+        binding.tvWarmupValue.text = "${prefs.warmupSeconds} 秒"
+        binding.tvLookaheadValue.text = "${prefs.lookaheadSeconds} 秒"
     }
 
     private fun setupTtsListener() {
@@ -470,9 +539,11 @@ class LibraryActivity : AppCompatActivity() {
                 arrayOf(
                     "${getString(R.string.mode_mixed)} · ${getString(R.string.mode_mixed_desc)}",
                     "${getString(R.string.mode_chinese)} · ${getString(R.string.mode_chinese_desc)}"
-                ), 0
+                ), if (prefs.defaultMode == "chinese") 1 else 0
             ) { dialog, which ->
                 val mode = if (which == 1) "chinese" else "mixed"
+                // 记住这次的转换模式，下次导入时默认选中。
+                prefs.defaultMode = mode
                 runCatching { startConvertService(uris, mode) }.onFailure { error ->
                     Toast.makeText(
                         this,
@@ -622,69 +693,13 @@ class LibraryActivity : AppCompatActivity() {
         }
     }
 
-    private fun showSettings() {
-        val warmup = prefs.warmupSeconds
-        val lookahead = prefs.lookaheadSeconds
-        val defaultMode = prefs.defaultMode
-        val cacheMB = cache.totalSizeMB()
-
-        MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.settings_title)
-            .setItems(arrayOf(
-                getString(R.string.warmup_label) + "：${warmup} 秒",
-                getString(R.string.lookahead_label) + "：${lookahead} 秒",
-                getString(R.string.default_mode_label) + "：" + getString(if (defaultMode == "chinese") R.string.mode_chinese else R.string.mode_mixed),
-                getString(R.string.cache_size_label) + "：${cacheMB} MB",
-                getString(R.string.cache_clean),
-                getString(R.string.diagnostics),
-            )) { _, which ->
-                when (which) {
-                    0 -> editWarmup()
-                    1 -> editLookahead()
-                    2 -> editDefaultMode()
-                    4 -> cleanCache()
-                    5 -> showDiagnostics()
-                }
-            }.setNegativeButton(R.string.cancel, null).show()
-    }
-
-    private fun editWarmup() {
-        val values = intArrayOf(5, 10, 15, 20, 30, 45, 60, 90, 120)
-        val labels = values.map { "${it} 秒" }.toTypedArray()
-        val checked = values.indexOf(prefs.warmupSeconds).coerceAtLeast(0)
-        MaterialAlertDialogBuilder(this).setTitle(R.string.warmup_label).setMessage(R.string.warmup_hint)
-            .setSingleChoiceItems(labels, checked) { d, w -> prefs.warmupSeconds = values[w]; d.dismiss(); showSettings() }
-            .setNegativeButton(R.string.cancel, null).show()
-    }
-
-    private fun editLookahead() {
-        val values = intArrayOf(10, 20, 30, 45, 60, 90, 120)
-        val labels = values.map { "${it} 秒" }.toTypedArray()
-        val checked = values.indexOf(prefs.lookaheadSeconds).coerceAtLeast(0)
-        MaterialAlertDialogBuilder(this).setTitle(R.string.lookahead_label)
-            .setSingleChoiceItems(labels, checked) { d, w -> prefs.lookaheadSeconds = values[w]; d.dismiss(); showSettings() }
-            .setNegativeButton(R.string.cancel, null).show()
-    }
-
-    private fun editDefaultMode() {
-        MaterialAlertDialogBuilder(this).setTitle(R.string.default_mode_label)
-            .setSingleChoiceItems(
-                arrayOf(
-                    "${getString(R.string.mode_mixed)} · ${getString(R.string.mode_mixed_desc)}",
-                    "${getString(R.string.mode_chinese)} · ${getString(R.string.mode_chinese_desc)}"
-                ), if (prefs.defaultMode == "chinese") 1 else 0
-            ) { d, w ->
-                val mode = if (w == 1) "chinese" else "mixed"
-                prefs.defaultMode = mode
-                if (!tts.isPlaying()) tts.setMode(if (mode == "chinese") TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED)
-                d.dismiss(); showSettings()
-            }.setNegativeButton(R.string.cancel, null).show()
-    }
-
     private fun cleanCache() {
         MaterialAlertDialogBuilder(this).setTitle(R.string.cache_clean).setMessage(R.string.cache_clean_confirm)
             .setPositiveButton(android.R.string.ok) { _, _ ->
-                cache.clearAll(); Toast.makeText(this, R.string.cache_clean_done, Toast.LENGTH_SHORT).show(); refreshLibrary()
+                cache.clearAll()
+                Toast.makeText(this, R.string.cache_clean_done, Toast.LENGTH_SHORT).show()
+                refreshLibrary()
+                updateSettingsValues()
             }.setNegativeButton(R.string.cancel, null).show()
     }
 

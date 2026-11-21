@@ -21,9 +21,9 @@ class Prefs(context: Context) {
         get() = sp.getInt(KEY_LOOKAHEAD, 30).coerceIn(10, 120)
         set(v) = sp.edit().putInt(KEY_LOOKAHEAD, v.coerceIn(10, 120)).apply()
 
-    /** 默认语音模式 "mixed" / "chinese" */
+    /** 默认语音模式 "mixed" / "chinese"，默认中文女声（更快） */
     var defaultMode: String
-        get() = sp.getString(KEY_MODE, "mixed") ?: "mixed"
+        get() = sp.getString(KEY_MODE, "chinese") ?: "chinese"
         set(v) = sp.edit().putString(KEY_MODE, v).apply()
 
     companion object {

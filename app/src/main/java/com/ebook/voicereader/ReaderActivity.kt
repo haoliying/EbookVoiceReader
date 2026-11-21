@@ -313,6 +313,9 @@ class ReaderActivity : AppCompatActivity() {
         MaterialAlertDialogBuilder(this).setTitle(R.string.voice_mode_title)
             .setSingleChoiceItems(labels, checked) { d, w ->
                 tts.setMode(modes[w])
+                // 记住用户的选择，书库设置页与下次启动都保持一致。
+                App.instance.prefs.defaultMode =
+                    if (modes[w] == TtsManager.Mode.CHINESE) "chinese" else "mixed"
                 Toast.makeText(this, getString(R.string.mode_switched, getString(if (modes[w] == TtsManager.Mode.CHINESE) R.string.mode_chinese else R.string.mode_mixed)), Toast.LENGTH_SHORT).show()
                 d.dismiss()
             }.setNegativeButton(R.string.cancel, null).show()

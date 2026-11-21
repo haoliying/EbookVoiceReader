@@ -112,7 +112,8 @@ class TtsManager(private val context: Context) {
     private var mixedEngine: OfflineTts? = null
 
     @Volatile private var ready = false
-    @Volatile private var mode = Mode.MIXED
+    /** 默认中文女声：模型更小、转换与播放都更快 */
+    @Volatile private var mode = Mode.CHINESE
     @Volatile private var session = 0
     @Volatile private var paused = false
     @Volatile private var stopRequested = true
