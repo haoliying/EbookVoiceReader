@@ -55,6 +55,8 @@ class LibraryActivity : AppCompatActivity() {
     }
 
     private lateinit var adapter: LibraryAdapter
+    /** 自动续转每次进入书库只尝试一次，避免反复拉起服务 */
+    private var autoResumeDone = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -201,7 +203,11 @@ class LibraryActivity : AppCompatActivity() {
     private fun pauseConvert(item: LibraryItem) {
         ConvertService.pauseBook(item.bookId)
         cache.metaOf(item.bookId)?.let {
-            runCatching { cache.saveMeta(it.copy(status = CacheManager.Status.PAUSED)) }
+            runCatching {
+                cache.saveMeta(it.copy(
+                    status = CacheManager.Status.PAUSED, pausedByUser = true,
+                ))
+            }
         }
         Toast.makeText(this, "已暂停《${item.title}》的转换", Toast.LENGTH_SHORT).show()
         refreshLibrary()
@@ -210,6 +216,10 @@ class LibraryActivity : AppCompatActivity() {
     /** 继续转换：协程还在就直接续跑，否则重新拉起服务从中断处继续。 */
     private fun resumeConvert(item: LibraryItem) {
         ConvertService.resumeBook(item.bookId)
+        // 用户明确要求继续，清除“主动暂停”标记，之后中断仍可自动续转。
+        cache.metaOf(item.bookId)?.let {
+            runCatching { cache.saveMeta(it.copy(pausedByUser = false)) }
+        }
         if (ConvertService.isBookRunning(item.bookId)) {
             refreshLibrary()
             return
@@ -241,6 +251,61 @@ class LibraryActivity : AppCompatActivity() {
             scheduleRefreshWhileRunning()
         }
         refreshLibrary()
+    }
+
+    /**
+     * 上次转换被系统中断（服务被回收、进程被杀）后，进入书库自动从断点继续。
+     * 用户主动暂停的书（pausedByUser）不会被自动续转。
+     */
+    private fun autoResumeInterruptedConversions() {
+        if (autoResumeDone) return
+        val candidates = runCatching { cache.listAll() }.getOrDefault(emptyList()).filter {
+            it.status == CacheManager.Status.PAUSED &&
+                !it.pausedByUser &&
+                it.paragraphCount > 0 &&
+                it.convertedUpTo >= 0 &&
+                it.convertedUpTo < it.paragraphCount - 1 &&
+                it.sourceUri.isNotBlank() &&
+                !ConvertService.isUserPaused(it.bookId)
+        }
+        if (candidates.isEmpty()) {
+            autoResumeDone = true
+            return
+        }
+        autoResumeDone = true
+        App.traceSafe("library:自动续转 ${candidates.size} 本中断的书籍")
+        var started = false
+        candidates.groupBy { if (it.mode.equals("chinese", true)) "chinese" else "mixed" }
+            .forEach { (mode, metas) ->
+                val pairs = metas.mapNotNull { m ->
+                    runCatching { Uri.parse(m.sourceUri) }.getOrNull()?.let { it to m.title }
+                }
+                if (pairs.isEmpty()) return@forEach
+                pairs.forEach { pair ->
+                    runCatching {
+                        contentResolver.takePersistableUriPermission(
+                            pair.first, Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                    }
+                }
+                val intent = Intent(this, ConvertService::class.java).apply {
+                    putExtra(ConvertService.EXTRA_ACTION, ConvertService.ACTION_START)
+                    putParcelableArrayListExtra(
+                        ConvertService.EXTRA_URIS, ArrayList(pairs.map { it.first }),
+                    )
+                    putStringArrayListExtra(
+                        ConvertService.EXTRA_DISPLAY_NAMES, ArrayList(pairs.map { it.second }),
+                    )
+                    putExtra(ConvertService.EXTRA_MODE, mode)
+                }
+                val ok = runCatching { ContextCompat.startForegroundService(this, intent) }.isSuccess ||
+                    runCatching { startService(intent) != null }.getOrDefault(false)
+                if (ok) started = true
+            }
+        if (started) {
+            scheduleRefreshWhileRunning()
+            Toast.makeText(this, "已自动继续上次未完成的转换", Toast.LENGTH_SHORT).show()
+        }
     }
 
     /** 长按书籍卡片：确认后删除书籍及其语音缓存。 */
@@ -475,7 +540,7 @@ class LibraryActivity : AppCompatActivity() {
     private val refreshTick = object : Runnable {
         override fun run() {
             refreshLibrary()
-            if (ConvertService.registry.isRunning()) {
+            if (ConvertService.hasRunningJobs()) {
                 binding.rvLibrary.postDelayed(this, 1000)
             }
         }
@@ -636,7 +701,11 @@ class LibraryActivity : AppCompatActivity() {
         if (tts.isReady()) binding.tvEngineHint.setText(R.string.engine_ready_short)
         updatePlayingBar()
         refreshLibrary()
-        if (ConvertService.registry.isRunning()) scheduleRefreshWhileRunning()
+        if (ConvertService.hasRunningJobs()) {
+            scheduleRefreshWhileRunning()
+        } else {
+            autoResumeInterruptedConversions()
+        }
     }
 
     override fun onPause() {

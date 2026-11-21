@@ -88,9 +88,13 @@ class ConvertService : Service() {
         /** 删除书籍时可立即取消对应协程，不必等当前段合成结束。 */
         private val bookJobs = ConcurrentHashMap<String, Job>()
 
+        /** 用户主动暂停的书：服务重启后不能自动继续，必须等用户点“继续转换”。 */
+        private val userPausedBooks = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
         fun skipBook(bookId: String) {
             deletedBooks.add(bookId)
             pausedBooks.remove(bookId)
+            userPausedBooks.remove(bookId)
             runningBooks.remove(bookId)
             registry.remove(bookId)
             bookJobs.remove(bookId)?.cancel()
@@ -104,18 +108,26 @@ class ConvertService : Service() {
         /** 暂停某本书的转换，已转换的片段与断点全部保留。 */
         fun pauseBook(bookId: String) {
             pausedBooks.add(bookId)
+            userPausedBooks.add(bookId)
             registry.update(bookId) { it.copy(status = TaskStatus.PAUSED) }
         }
 
         /** 继续转换（协程还在时直接续跑，否则由界面重新拉起服务）。 */
         fun resumeBook(bookId: String) {
             pausedBooks.remove(bookId)
+            userPausedBooks.remove(bookId)
             registry.update(bookId) { it.copy(status = TaskStatus.CONVERTING) }
         }
 
         fun isBookPaused(bookId: String): Boolean = bookId in pausedBooks
 
         fun isBookRunning(bookId: String): Boolean = bookId in runningBooks
+
+        /** 用户主动暂停、不希望应用自动续转。 */
+        fun isUserPaused(bookId: String): Boolean = bookId in userPausedBooks
+
+        /** 是否真的有转换协程在工作（暂停等待中的也算）。 */
+        fun hasRunningJobs(): Boolean = runningBooks.isNotEmpty() || bookJobs.isNotEmpty()
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -127,6 +139,12 @@ class ConvertService : Service() {
      * 这里限流主要是避免多本大 PDF 同时解析把内存吃满。
      */
     private val convertSlots = Semaphore(2)
+
+    /**
+     * 解析阶段单独串行：大 PDF 解析的内存峰值远高于合成，
+     * 两本同时解析很容易被系统判定 OOM 并杀掉进程，表现为“转一点就停了”。
+     */
+    private val parseSlots = Semaphore(1)
 
     private lateinit var cache: CacheManager
     private lateinit var ttsManager: TtsManager
@@ -242,6 +260,7 @@ class ConvertService : Service() {
         val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
         clearSkip(bookId)
         pausedBooks.remove(bookId)
+        userPausedBooks.remove(bookId)
         runningBooks.add(bookId)
         // 同一本书重复点击时先取消旧任务，避免两个协程同时写同一本书。
         bookJobs.remove(bookId)?.cancel()
@@ -249,15 +268,16 @@ class ConvertService : Service() {
 
         bookJobs[bookId] = scope.launch {
             try {
-                // 引擎可能仍在加载，最多等 10 秒。
+                // 首次启动引擎要加载约 190MB 模型，低端机可能需要几十秒。
+                // 之前只等 10 秒，很多设备会直接判失败，看起来就是“转一点就停”。
                 var wait = 0
-                while (!ttsManager.isReady() && wait < 50) {
+                while (!ttsManager.isReady() && wait < 300) {
                     if (cancelState.isCancelled) break
                     delay(200); wait++
                 }
                 App.traceSafe("service:引擎就绪=${ttsManager.isReady()}，等待 ${wait * 200}ms")
                 if (!ttsManager.isReady()) {
-                    failBook(bookId, displayName, uri, mode, "语音引擎加载失败，请打开书库后重试")
+                    pauseWithReason(bookId, displayName, uri, mode, "语音引擎加载超时，可稍后继续转换")
                     return@launch
                 }
                 App.traceSafe("service:开始转换 $displayName")
@@ -295,8 +315,29 @@ class ConvertService : Service() {
 
     override fun onDestroy() {
         cancelState.cancel()
+        // 服务被系统回收（内存紧张、后台限制）时，正在转换的书不能永远停在“转换中”。
+        // 统一落成“已暂停”，并把断点写回 meta，下次进入书库会自动接着转换。
+        val interrupted = registry.all().filter {
+            it.status == TaskStatus.CONVERTING || it.status == TaskStatus.PENDING
+        }
+        for (task in interrupted) {
+            registry.update(task.bookId) { it.copy(status = TaskStatus.PAUSED) }
+            runCatching {
+                cache.metaOf(task.bookId)?.let { m ->
+                    if (m.status == CacheManager.Status.CONVERTING ||
+                        m.status == CacheManager.Status.NONE
+                    ) {
+                        cache.saveMeta(m.copy(status = CacheManager.Status.PAUSED))
+                    }
+                }
+            }
+        }
+        if (interrupted.isNotEmpty()) {
+            App.traceSafe("service:服务停止，${interrupted.size} 本转为暂停，可自动续转")
+        }
         bookJobs.values.forEach { it.cancel() }
         bookJobs.clear()
+        runningBooks.clear()
         // 注意：不能 release() 共享的 ttsManager，否则会连带卸载正在播放的引擎
         super.onDestroy()
     }
@@ -317,7 +358,7 @@ class ConvertService : Service() {
 
         val book: Book = try {
             App.traceSafe("convert:解析开始 $displayName ext=$ext")
-            convertSlots.withPermit {
+            parseSlots.withPermit {
                 reader.read(this, uri, displayName) { /* no progress */ }
             }.also {
                 App.traceSafe("convert:解析完成 段数=${it.paragraphs.size}")
@@ -449,7 +490,22 @@ class ConvertService : Service() {
                 refreshNotification()
                 continue
             }
-            val result = convertSlots.withPermit { ttsManager.synthesizeParagraph(text, mode) }
+            // 单段合成失败多为内存抖动或引擎瞬时不可用，重试几次通常能成功。
+            // 直接放弃整本书会让用户看到“转一点就停”。
+            var result: Pair<ShortArray, Int>? = null
+            var attempt = 0
+            while (attempt < 3 && result == null) {
+                if (attempt > 0) delay(500L * attempt)
+                if (isBookSkipped(bookId) || cancelState.isCancelled) return
+                result = convertSlots.withPermit { ttsManager.synthesizeParagraph(text, mode) }
+                if (result == null) {
+                    App.traceSafe(
+                        "convert:合成失败 段=$i 第${attempt + 1}次 " +
+                            "可用内存=${App.instance.availableMemoryMB()}MB"
+                    )
+                }
+                attempt++
+            }
             // 原生合成可能耗时数秒，删除往往就发生在这段时间内。
             // 返回后必须再检查一次，不能把结果写回已删除的书籍目录。
             if (isBookSkipped(bookId)) {
@@ -457,8 +513,10 @@ class ConvertService : Service() {
                 return
             }
             if (result == null) {
-                App.traceSafe("convert:合成返回空 段=$i")
-                failed = true; failReason = "语音合成失败"; break
+                App.traceSafe("convert:合成连续失败 ${attempt} 次 段=$i，转为暂停待续")
+                failed = true
+                failReason = "语音合成失败（已重试 $attempt 次），可稍后继续"
+                break
             }
             if (i < 3 || i % 20 == 0) {
                 App.traceSafe("convert:合成第 $i 段完成 · 可用内存 ${App.instance.availableMemoryMB()}MB")
@@ -477,8 +535,22 @@ class ConvertService : Service() {
         }
 
         if (failed) {
-            persist(CacheManager.Status.FAILED)
-            failBook(bookId, title, uri, mode, failReason ?: "语音合成失败")
+            // 失败也保留断点并落为“已暂停”，下次可继续，而不是每次从头再来。
+            val reason = failReason ?: "语音合成失败"
+            runCatching {
+                cache.saveMeta(meta.copy(
+                    convertedUpTo = done, totalSeconds = totalSec,
+                    sampleRate = rate, status = CacheManager.Status.PAUSED,
+                    errorMessage = reason,
+                ))
+            }
+            registry.update(bookId) { it.copy(
+                done = done, total = total, status = TaskStatus.PAUSED,
+                totalSeconds = totalSec, message = reason
+            ) }
+            startBroadcast(ACTION_CONVERT_PROGRESS, bookId, title, uri, mode.name,
+                done, total, totalSec, reason, TaskStatus.PAUSED)
+            refreshNotification()
             return
         }
 
@@ -489,6 +561,41 @@ class ConvertService : Service() {
         ) }
         startBroadcast(ACTION_CONVERT_DONE, bookId, title, uri, mode.name,
             total, total, totalSec, null)
+    }
+
+    /**
+     * 因引擎未就绪等原因暂停（不是用户主动暂停）。
+     * 落为 PAUSED 而不是 FAILED，进入书库时会自动接着转换。
+     */
+    private fun pauseWithReason(
+        bookId: String, title: String, uri: Uri, mode: TtsManager.Mode, reason: String,
+    ) {
+        registry.ensure(
+            TaskInfo(
+                bookId = bookId, title = title, uri = uri.toString(),
+                mode = mode.name.lowercase(), total = 0, done = -1,
+                status = TaskStatus.PAUSED, totalSeconds = 0f,
+            )
+        )
+        registry.update(bookId) { it.copy(status = TaskStatus.PAUSED, message = reason) }
+        runCatching {
+            val existing = cache.metaOf(bookId)
+            if (existing != null) {
+                cache.saveMeta(existing.copy(
+                    status = CacheManager.Status.PAUSED, errorMessage = reason,
+                ))
+            } else {
+                cache.saveMeta(CacheManager.Meta(
+                    bookId = bookId, sourceUri = uri.toString(), title = title, format = "",
+                    paragraphCount = 0, totalSeconds = 0f, sampleRate = 22050,
+                    mode = mode.name.lowercase(), convertedUpTo = -1,
+                    status = CacheManager.Status.PAUSED,
+                    createdAt = System.currentTimeMillis(), errorMessage = reason,
+                ))
+            }
+        }
+        startBroadcast(ACTION_CONVERT_PROGRESS, bookId, title, uri, mode.name,
+            -1, 0, 0f, reason, TaskStatus.PAUSED)
     }
 
     private fun failBook(

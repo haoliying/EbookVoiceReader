@@ -50,6 +50,7 @@ class CacheManager(private val context: Context) {
                 createdAt = o.optLong("createdAt", 0L),
                 errorMessage = o.optString("errorMessage", ""),
                 lastPlayedIndex = o.optInt("lastPlayedIndex", -1),
+                pausedByUser = o.optBoolean("pausedByUser", false),
             )
         }.getOrNull()
     }
@@ -68,6 +69,7 @@ class CacheManager(private val context: Context) {
             .put("createdAt", meta.createdAt)
             .put("errorMessage", meta.errorMessage)
             .put("lastPlayedIndex", meta.lastPlayedIndex)
+            .put("pausedByUser", meta.pausedByUser)
         metaFile(meta.bookId).writeText(o.toString())
     }
 
@@ -183,6 +185,8 @@ class CacheManager(private val context: Context) {
         val errorMessage: String = "",
         /** 上次播放到的段落（-1 = 未播放过） */
         val lastPlayedIndex: Int = -1,
+        /** 是否由用户主动暂停（主动暂停的书不会被自动续转） */
+        val pausedByUser: Boolean = false,
     )
 
     enum class Status { NONE, CONVERTING, PAUSED, DONE, FAILED }
