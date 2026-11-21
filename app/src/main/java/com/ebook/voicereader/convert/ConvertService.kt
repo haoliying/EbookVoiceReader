@@ -456,22 +456,43 @@ class ConvertService : Service() {
             return
         }
 
-        val book: Book = try {
-            App.traceSafe("convert:解析开始 $displayName ext=$ext")
-            parseSlots.withPermit {
-                reader.read(this, uri, displayName) { /* no progress */ }
-            }.also {
-                App.traceSafe("convert:解析完成 段数=${it.paragraphs.size}")
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Throwable) {
-            App.traceSafe("convert:解析失败 ${e.javaClass.name}: ${e.message}")
-            failBook(
-                bookId, displayName, uri, mode,
-                "解析失败：${e.message ?: e.javaClass.simpleName}",
+        val existing = cache.metaOf(bookId)
+        // 扫描版 PDF 的 OCR 可能耗时几十分钟。服务重启后续转时直接复用已解析正文，
+        // 不再重新解析整本书，这是“退出后继续转换”场景的最大提速点。
+        val cachedParagraphs = cache.loadParagraphs(bookId)
+        val reuseParsed = cachedParagraphs != null && cachedParagraphs.isNotEmpty() &&
+            existing != null && existing.paragraphCount == cachedParagraphs.size
+
+        val book: Book = if (reuseParsed) {
+            App.traceSafe("convert:复用已解析正文 ${cachedParagraphs!!.size} 段，跳过解析")
+            Book(
+                title = existing!!.title.ifBlank { displayName },
+                paragraphs = cachedParagraphs,
+                sourceFormat = existing.format.ifBlank { ext },
             )
-            return
+        } else {
+            val parseStartAt = android.os.SystemClock.elapsedRealtime()
+            try {
+                App.traceSafe("convert:解析开始 $displayName ext=$ext")
+                parseSlots.withPermit {
+                    reader.read(this, uri, displayName) { /* no progress */ }
+                }.also {
+                    App.traceSafe(
+                        "convert:解析完成 段数=${it.paragraphs.size} " +
+                            "耗时=${android.os.SystemClock.elapsedRealtime() - parseStartAt}ms " +
+                            "OCR=${it.usedOcr}"
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                App.traceSafe("convert:解析失败 ${e.javaClass.name}: ${e.message}")
+                failBook(
+                    bookId, displayName, uri, mode,
+                    "解析失败：${e.message ?: e.javaClass.simpleName}",
+                )
+                return
+            }
         }
 
         if (book.paragraphs.isEmpty()) {
@@ -481,6 +502,9 @@ class ConvertService : Service() {
 
         // 解析期间用户可能已经删除了这本书，此时不能再写缓存。
         if (isBookSkipped(bookId)) return
+
+        // 正文落盘，下次续转（包括进程被杀、服务重启）直接读取。
+        if (!reuseParsed) cache.saveParagraphs(bookId, book.paragraphs)
 
         val title = book.title.ifBlank { displayName }
         val total = book.paragraphs.size
@@ -498,7 +522,6 @@ class ConvertService : Service() {
         ) }
         startBroadcast(ACTION_CONVERT_START, bookId, title, uri, mode.name, -1, total, 0f, null)
 
-        val existing = cache.metaOf(bookId)
         // 已经转换出的片段一律复用：中途崩溃、暂停、取消或被系统中断后重新转换，
         // 都从上次的进度继续，而不是从头再来。
         val startFrom = existing?.let {
@@ -524,6 +547,7 @@ class ConvertService : Service() {
         var done = startFrom - 1
         var failed = false
         var failReason: String? = null
+        val synthStartAt = android.os.SystemClock.elapsedRealtime()
 
         // 把当前断点与状态写回 meta，暂停/继续都靠它跨进程恢复。
         fun persist(status: CacheManager.Status) {
@@ -655,6 +679,14 @@ class ConvertService : Service() {
             persistIfDue()
             reportIfDue()
         }
+
+        // 便于排查真实耗时：解析多久、合成多久、平均每段多少毫秒。
+        val synthMs = android.os.SystemClock.elapsedRealtime() - synthStartAt
+        val count = (done - startFrom + 1).coerceAtLeast(1)
+        App.traceSafe(
+            "convert:$title 合成 $count 段 用时=${synthMs}ms " +
+                "平均=${synthMs / count}ms/段 失败=$failed"
+        )
 
         if (failed) {
             // 失败也保留断点并落为“已暂停”，下次可继续，而不是每次从头再来。

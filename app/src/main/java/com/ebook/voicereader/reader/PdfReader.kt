@@ -101,9 +101,11 @@ class PdfReader(private val ocrEngine: OcrEngine) : DocumentReader {
             val pageCount = renderer.pageCount
             for (i in 0 until pageCount) {
                 renderer.openPage(i).use { page ->
-                    val width = page.width.coerceAtMost(1500)
+                    // 1280px 宽对书页文字识别足够，像素量比 1500px 少约 27%，
+                    // OCR 单页耗时明显下降；RGB_565 还能再省一半渲染内存。
+                    val width = page.width.coerceAtMost(1280)
                     val height = (page.height * (width.toFloat() / page.width)).toInt()
-                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
                     page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
                     val text = ocrEngine.recognize(bitmap)
                     if (text.isNotBlank()) {

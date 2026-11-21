@@ -141,6 +141,50 @@ class CacheManager(private val context: Context) {
         chunkFile(bookId, paraIndex).writeBytes(bytes)
     }
 
+    /**
+     * 缓存解析后的正文。
+     * 扫描版 PDF 的 OCR 可能耗时几十分钟，服务重启后直接复用，
+     * 不必每次续转都重新解析整本书。
+     */
+    fun saveParagraphs(bookId: String, paragraphs: List<String>) {
+        runCatching {
+            val dir = bookDir(bookId)
+            java.util.zip.GZIPOutputStream(
+                java.io.BufferedOutputStream(java.io.FileOutputStream(File(dir, PARAGRAPHS_FILE)))
+            ).use { gz ->
+                val out = java.io.DataOutputStream(gz)
+                out.writeInt(paragraphs.size)
+                for (p in paragraphs) {
+                    val bytes = p.toByteArray(Charsets.UTF_8)
+                    out.writeInt(bytes.size)
+                    out.write(bytes)
+                }
+                out.flush()
+            }
+        }
+    }
+
+    fun loadParagraphs(bookId: String): List<String>? = runCatching {
+        val f = File(File(root, bookId), PARAGRAPHS_FILE)
+        if (!f.exists() || f.length() == 0L) return@runCatching null
+        java.util.zip.GZIPInputStream(
+            java.io.BufferedInputStream(java.io.FileInputStream(f))
+        ).use { gz ->
+            val input = java.io.DataInputStream(gz)
+            val size = input.readInt()
+            if (size <= 0 || size > 500_000) return@runCatching null
+            val list = ArrayList<String>(size)
+            repeat(size) {
+                val len = input.readInt()
+                if (len < 0 || len > 8 * 1024 * 1024) return@runCatching null
+                val bytes = ByteArray(len)
+                input.readFully(bytes)
+                list.add(String(bytes, Charsets.UTF_8))
+            }
+            list
+        }
+    }.getOrNull()
+
     /** 总缓存大小（MB） */
     fun totalSizeMB(): Long {
         var total = 0L
@@ -159,6 +203,9 @@ class CacheManager(private val context: Context) {
     }
 
     companion object {
+        /** 解析后的正文缓存文件（gzip 压缩） */
+        private const val PARAGRAPHS_FILE = "paragraphs.dat"
+
         fun idOf(uriOrPath: String): String {
             val digest = MessageDigest.getInstance("SHA-1")
             val raw = uriOrPath.toByteArray()

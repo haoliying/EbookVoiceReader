@@ -71,7 +71,7 @@ class TtsManager(private val context: Context) {
     companion object {
         private const val DIR_ZH = "tts/zh_CN-xiao_ya"
         private const val DIR_MIXED = "tts/zh_en-melo"
-        private const val MAX_CHUNK = 80
+        private const val MAX_CHUNK = 220
         private const val SAMPLE_CHUNK = 4096
         private const val TARGET_PEAK = 0.9f
         private const val MAX_GAIN = 6f
@@ -713,13 +713,13 @@ class TtsManager(private val context: Context) {
                     lexicon = "$dir/lexicon.txt",
                     tokens = "$dir/tokens.txt",
                 ),
-                // 只开 2 线程会让 8 核手机合成速度只有理论值的四分之一。
-                // 推理本身由 engineMutex 串行，多个引擎不会同时抢占线程。
-                numThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4),
+                // 8 核手机给到 6 线程；推理本身由 engineMutex 串行，不会互相抢占。
+                numThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6),
                 debug = false, provider = "cpu",
             ),
             ruleFsts = "$dir/date.fst,$dir/number.fst,$dir/phone.fst",
-            maxNumSentences = 1, silenceScale = 0.15f,
+            // 一次推理批量处理多句，能显著减少每个短句的固定调用开销。
+            maxNumSentences = 8, silenceScale = 0.15f,
         )
         return OfflineTts(assetManager = context.assets, config = config)
     }
