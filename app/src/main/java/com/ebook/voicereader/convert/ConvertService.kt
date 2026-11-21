@@ -9,7 +9,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.ebook.voicereader.App
 import com.ebook.voicereader.cache.CacheManager
@@ -52,6 +54,8 @@ class ConvertService : Service() {
         const val EXTRA_ACTION = "action"
         const val ACTION_START = "start"
         const val ACTION_CANCEL = "cancel"
+        /** 系统重建服务或任务被移除后，恢复未完成的转换 */
+        const val ACTION_RESUME = "resume"
         const val CHANNEL_ID = "ebook_convert"
         const val NOTIFY_ID = 1001
 
@@ -152,6 +156,12 @@ class ConvertService : Service() {
     private var manager: NotificationManager? = null
     private var lbm: LocalBroadcastManager? = null
 
+    /**
+     * 前台服务只保证进程不被轻易回收，屏幕熄灭后 CPU 仍会休眠。
+     * 转换期间持有 PARTIAL_WAKE_LOCK，才能退出应用、锁屏后继续合成。
+     */
+    private var wakeLock: PowerManager.WakeLock? = null
+
     override fun onCreate() {
         super.onCreate()
         // 复用 App 的全局单例：绝不在这里再 new 一个 TtsManager。
@@ -177,11 +187,11 @@ class ConvertService : Service() {
                 "foreground=${foregroundError == null} 可用内存=${App.instance.availableMemoryMB()}MB"
         )
 
-        // 进程被系统重建时可能拿不到原始 Intent，此时没有任务可做。
+        // 进程被系统重建时拿不到原始 Intent（START_STICKY 重启），
+        // 此时从 meta 恢复未完成的转换，而不是直接结束服务。
         if (intent == null) {
-            App.traceSafe("service:intent=null，结束服务")
-            stopSelf()
-            return START_NOT_STICKY
+            App.traceSafe("service:intent=null，尝试恢复未完成任务")
+            return handleResume()
         }
 
         return try {
@@ -199,6 +209,9 @@ class ConvertService : Service() {
     }
 
     private fun handleStart(intent: Intent, foregroundError: Throwable?): Int {
+        if (intent.getStringExtra(EXTRA_ACTION) == ACTION_RESUME) {
+            return handleResume()
+        }
         if (intent.getStringExtra(EXTRA_ACTION) == ACTION_CANCEL) {
             cancelState.cancel()
             registry.markAllCancelled()
@@ -249,14 +262,99 @@ class ConvertService : Service() {
             launchBook(uri, displayName, mode)
         }
 
-        // 不用 START_STICKY：进程被系统回收后服务若被悄悄重启，
-        // 重启发生在后台，容易和「打开应用」抢同一时刻，表现为一打开就闪退。
-        // 转换可以从 meta 断点继续，用户重新选择本书或长按继续转换即可。
-        return START_NOT_STICKY
+        // 用 START_STICKY：用户退出应用或进程被系统回收后，服务会被重建，
+        // 重建时会走 handleResume() 从断点继续转换，而不是停在前台通知里。
+        return START_STICKY
+    }
+
+    /**
+     * 服务被系统重建（START_STICKY）或用户划掉最近任务后调用。
+     * 已有任务在跑就不重复启动，否则从 meta 中找到未完成的转换继续。
+     */
+    private fun handleResume(): Int {
+        if (hasRunningJobs()) {
+            App.traceSafe("service:收到恢复请求，任务仍在运行")
+            return START_STICKY
+        }
+        resumeInterruptedFromCache()
+        return START_STICKY
+    }
+
+    /** 从 meta 恢复被中断的转换；用户主动暂停的书不会自动继续。 */
+    private fun resumeInterruptedFromCache() {
+        scope.launch {
+            val metas = runCatching { cache.listAll() }.getOrDefault(emptyList())
+            val candidates = metas.filter {
+                (it.status == CacheManager.Status.CONVERTING ||
+                    it.status == CacheManager.Status.PAUSED) &&
+                    !it.pausedByUser &&
+                    it.paragraphCount > 0 &&
+                    it.convertedUpTo < it.paragraphCount - 1 &&
+                    it.sourceUri.isNotBlank()
+            }
+            if (candidates.isEmpty()) {
+                App.traceSafe("service:没有需要恢复的转换任务，结束服务")
+                startBroadcast(ACTION_CONVERT_ALL_DONE)
+                stopSelf()
+                return@launch
+            }
+            App.traceSafe("service:恢复 ${candidates.size} 本未完成的转换")
+            val needChinese = candidates.any { it.mode.equals("chinese", ignoreCase = true) }
+            ttsManager.init(if (needChinese) TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED)
+            for (m in candidates) {
+                val uri = runCatching { Uri.parse(m.sourceUri) }.getOrNull() ?: continue
+                val mode = if (m.mode.equals("chinese", ignoreCase = true)) {
+                    TtsManager.Mode.CHINESE
+                } else {
+                    TtsManager.Mode.MIXED
+                }
+                launchBook(uri, m.title, mode)
+            }
+        }
+    }
+
+    /**
+     * 用户从最近任务划掉应用时，部分系统会连带停止服务。
+     * 这里主动尝试再拉起一次前台服务；即使失败，START_STICKY 也会在进程存活时重建。
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        App.traceSafe("service:任务被移除，尝试保持后台转换")
+        runCatching {
+            val intent = Intent(this, ConvertService::class.java)
+                .putExtra(EXTRA_ACTION, ACTION_RESUME)
+            ContextCompat.startForegroundService(this, intent)
+        }.onFailure {
+            App.traceSafe("service:任务移除后重启服务失败 ${it.javaClass.simpleName}")
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
+    private fun ensureWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK, "EbookVoiceReader:convert",
+            ).apply {
+                setReferenceCounted(false)
+                // 30 分钟自动过期，防止异常情况下长期占用；
+                // 转换过程中会周期性续期。
+                acquire(30 * 60 * 1000L)
+            }
+            App.traceSafe("service:已获取转换唤醒锁")
+        }
+    }
+
+    private fun releaseWakeLock() {
+        runCatching {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            wakeLock = null
+        }
     }
 
     /** 为一本书启动独立转换协程。 */
     private fun launchBook(uri: Uri, displayName: String, mode: TtsManager.Mode) {
+        ensureWakeLock()
         val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
         clearSkip(bookId)
         pausedBooks.remove(bookId)
@@ -306,6 +404,7 @@ class ConvertService : Service() {
 
     /** 所有书的协程都结束后收尾。被暂停的书协程仍在等待，不会走到这里。 */
     private fun finishBatch() {
+        releaseWakeLock()
         val hasPaused = registry.all().any { it.status == TaskStatus.PAUSED }
         if (!cancelState.isCancelled && !hasPaused) notifyDone()
         App.traceSafe("service:全部任务结束 paused=$hasPaused")
@@ -338,6 +437,7 @@ class ConvertService : Service() {
         bookJobs.values.forEach { it.cancel() }
         bookJobs.clear()
         runningBooks.clear()
+        releaseWakeLock()
         // 注意：不能 release() 共享的 ttsManager，否则会连带卸载正在播放的引擎
         super.onDestroy()
     }
@@ -451,6 +551,8 @@ class ConvertService : Service() {
         }
 
         fun reportIfDue() {
+            // 30 分钟超时的唤醒锁在这里顺手续期，锁屏后转换不会因 CPU 休眠而暂停。
+            ensureWakeLock()
             val now = android.os.SystemClock.elapsedRealtime()
             if (now - lastUiAt < 700L) return
             lastUiAt = now
@@ -488,10 +590,13 @@ class ConvertService : Service() {
                     done, total, totalSec, null, TaskStatus.PAUSED)
                 refreshNotification()
                 App.traceSafe("convert:已暂停 $title @${done + 1}/$total")
+                // 所有书都暂停时释放唤醒锁，避免无谓耗电。
+                if (runningBooks.all { isBookPaused(it) }) releaseWakeLock()
                 while (isBookPaused(bookId)) {
                     if (cancelState.isCancelled || isBookSkipped(bookId)) break
                     delay(300)
                 }
+                ensureWakeLock()
                 if (cancelState.isCancelled) {
                     registry.update(bookId) { it.copy(status = TaskStatus.CANCELLED) }
                     return
@@ -714,7 +819,9 @@ class ConvertService : Service() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle(title).setContentText(text)
-            .setOngoing(true).setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
         if (total > 0) builder.setProgress(total, done, false)
         return builder.build()
     }
@@ -739,7 +846,7 @@ class ConvertService : Service() {
             paused > 0 -> "正在转换 ${running.size - paused} 本 · 暂停 $paused 本"
             else -> "正在转换 ${running.size} 本书"
         }
-        val text = if (total > 0) "已完成 $done/$total 段" else "正在解析…"
+        val text = if (total > 0) "已完成 $done/$total 段 · 退出应用后仍会继续" else "正在解析…"
         updateNotification(title, text, done, total)
     }
 

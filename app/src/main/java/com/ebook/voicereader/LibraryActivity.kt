@@ -9,6 +9,8 @@ import android.content.IntentFilter
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -175,6 +177,38 @@ class LibraryActivity : AppCompatActivity() {
         val items = buildLibraryList()
         adapter.refreshAll(items)
         binding.emptyState.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+    }
+
+    /**
+     * 部分厂商系统会在退出应用后冻结后台任务。
+     * 首次开始转换时提示一次，把应用加入电池优化白名单，转换才能在后台稳定继续。
+     */
+    private fun maybePromptBatteryOptimization() {
+        val prefs = getSharedPreferences("ebook_ui", MODE_PRIVATE)
+        if (prefs.getBoolean("battery_prompt_done", false)) return
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        prefs.edit().putBoolean("battery_prompt_done", true).apply()
+        MaterialAlertDialogBuilder(this)
+            .setTitle("让转换在后台继续")
+            .setMessage(
+                "部分手机在退出应用后会限制后台任务。把「朗读时光」加入电池优化白名单，" +
+                    "退出应用后转换才能继续。"
+            )
+            .setPositiveButton("去设置") { _, _ ->
+                runCatching {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:$packageName"),
+                        )
+                    )
+                }.onFailure {
+                    Toast.makeText(this, "请在系统设置中允许后台运行", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
     }
 
     /** 长按书籍卡片：按当前状态提供暂停 / 继续转换 / 删除。 */
@@ -454,6 +488,7 @@ class LibraryActivity : AppCompatActivity() {
 
     private fun startConvertService(uris: List<Uri>, mode: String) {
         App.traceSafe("library:选择 ${uris.size} 个文件，模式=$mode")
+        maybePromptBatteryOptimization()
         val names = uris.map { getDisplayName(it) }
         val tasks = uris.mapIndexed { i, uri ->
             TaskInfo(
