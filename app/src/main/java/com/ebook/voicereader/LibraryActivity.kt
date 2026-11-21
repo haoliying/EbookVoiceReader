@@ -157,6 +157,7 @@ class LibraryActivity : AppCompatActivity() {
                 else -> {
                     binding.settingsPage.visibility = View.GONE
                     binding.fabImport.visibility = View.VISIBLE
+                    binding.rvLibrary.visibility = View.VISIBLE
                     refreshLibrary()
                     true
                 }
@@ -245,7 +246,10 @@ class LibraryActivity : AppCompatActivity() {
     private fun refreshLibrary() {
         val items = buildLibraryList()
         adapter.refreshAll(items)
-        binding.emptyState.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
+        val empty = items.isEmpty()
+        binding.emptyState.visibility = if (empty) View.VISIBLE else View.GONE
+        // 从设置页切回书架时必须恢复列表可见性，否则会看到空白书架。
+        binding.rvLibrary.visibility = if (empty) View.GONE else View.VISIBLE
     }
 
     /**
