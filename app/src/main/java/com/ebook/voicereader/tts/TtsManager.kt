@@ -76,6 +76,8 @@ class TtsManager(private val context: Context) {
         private const val TARGET_PEAK = 0.9f
         private const val MAX_GAIN = 6f
         private const val DEFAULT_SAMPLE_RATE = 22050
+        /** 缓存正则，避免每段都重新编译 */
+        private val SENTENCE_SPLIT = Regex("(?<=[。！？；!?;\\n])")
     }
 
     private class PreparedChunk(
@@ -578,7 +580,7 @@ class TtsManager(private val context: Context) {
     }
 
     private fun splitChunks(text: String): List<String> {
-        val sentences = text.split(Regex("(?<=[。！？；!?;\\n])"))
+        val sentences = text.split(SENTENCE_SPLIT)
         val out = mutableListOf<String>()
         var buf = StringBuilder()
         for (raw in sentences) {
@@ -711,7 +713,10 @@ class TtsManager(private val context: Context) {
                     lexicon = "$dir/lexicon.txt",
                     tokens = "$dir/tokens.txt",
                 ),
-                numThreads = 2, debug = false, provider = "cpu",
+                // 只开 2 线程会让 8 核手机合成速度只有理论值的四分之一。
+                // 推理本身由 engineMutex 串行，多个引擎不会同时抢占线程。
+                numThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4),
+                debug = false, provider = "cpu",
             ),
             ruleFsts = "$dir/date.fst,$dir/number.fst,$dir/phone.fst",
             maxNumSentences = 1, silenceScale = 0.15f,

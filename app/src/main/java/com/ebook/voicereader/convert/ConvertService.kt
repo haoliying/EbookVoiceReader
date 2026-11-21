@@ -436,6 +436,30 @@ class ConvertService : Service() {
             }
         }
 
+        // 每段都重写 meta.json、发广播、刷新通知会明显拖慢转换速度。
+        // 改成按时间/段数节流，保证性能的同时不丢失断点语义。
+        var lastPersistAt = 0L
+        var lastPersistDone = startFrom - 1
+        var lastUiAt = 0L
+
+        fun persistIfDue() {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastPersistAt < 2000L && done - lastPersistDone < 20) return
+            lastPersistAt = now
+            lastPersistDone = done
+            persist(CacheManager.Status.CONVERTING)
+        }
+
+        fun reportIfDue() {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastUiAt < 700L) return
+            lastUiAt = now
+            registry.update(bookId) { it.copy(done = done, total = total, totalSeconds = totalSec) }
+            startBroadcast(ACTION_CONVERT_PROGRESS, bookId, title, uri, mode.name,
+                done, total, totalSec, null)
+            refreshNotification()
+        }
+
         for (i in startFrom until total) {
             // 用户删除这本书：立刻放弃，保留删除结果。
             if (isBookSkipped(bookId)) {
@@ -483,11 +507,8 @@ class ConvertService : Service() {
             if (text.isBlank()) {
                 cache.writeChunk(bookId, i, ShortArray(0))
                 done = i
-                persist(CacheManager.Status.CONVERTING)
-                registry.update(bookId) { it.copy(done = i, total = total, totalSeconds = totalSec) }
-                startBroadcast(ACTION_CONVERT_PROGRESS, bookId, title, uri, mode.name,
-                    i, total, totalSec, null)
-                refreshNotification()
+                persistIfDue()
+                reportIfDue()
                 continue
             }
             // 单段合成失败多为内存抖动或引擎瞬时不可用，重试几次通常能成功。
@@ -526,12 +547,8 @@ class ConvertService : Service() {
             totalSec += pcm.size.toFloat() / r
             cache.writeChunk(bookId, i, pcm)
             done = i
-            persist(CacheManager.Status.CONVERTING)
-
-            registry.update(bookId) { it.copy(done = i, total = total, totalSeconds = totalSec) }
-            startBroadcast(ACTION_CONVERT_PROGRESS, bookId, title, uri, mode.name,
-                i, total, totalSec, null)
-            refreshNotification()
+            persistIfDue()
+            reportIfDue()
         }
 
         if (failed) {
