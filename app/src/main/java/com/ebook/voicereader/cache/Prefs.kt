@@ -26,9 +26,15 @@ class Prefs(context: Context) {
         get() = sp.getString(KEY_MODE, "chinese") ?: "chinese"
         set(v) = sp.edit().putString(KEY_MODE, v).apply()
 
+    /** 是否有未完成的转换需要在下次进程启动时恢复 */
+    var pendingConversion: Boolean
+        get() = sp.getBoolean(KEY_PENDING, false)
+        set(v) = sp.edit().putBoolean(KEY_PENDING, v).apply()
+
     companion object {
         private const val KEY_WARMUP = "warmup_seconds"
         private const val KEY_LOOKAHEAD = "lookahead_seconds"
         private const val KEY_MODE = "default_mode"
+        private const val KEY_PENDING = "pending_conversion"
     }
 }

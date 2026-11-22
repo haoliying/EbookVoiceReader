@@ -161,6 +161,8 @@ class ConvertService : Service() {
      * 转换期间持有 PARTIAL_WAKE_LOCK，才能退出应用、锁屏后继续合成。
      */
     private var wakeLock: PowerManager.WakeLock? = null
+    /** onDestroy 期间会取消任务，此时不能把 pending 标记清掉，否则无法自动续转 */
+    @Volatile private var destroying = false
 
     override fun onCreate() {
         super.onCreate()
@@ -215,6 +217,8 @@ class ConvertService : Service() {
         if (intent.getStringExtra(EXTRA_ACTION) == ACTION_CANCEL) {
             cancelState.cancel()
             registry.markAllCancelled()
+            App.instance.prefs.pendingConversion = false
+            ConversionWatchdog.cancel(this)
             startBroadcast(ACTION_CONVERT_ALL_DONE)
             stopSelf()
             return START_NOT_STICKY
@@ -294,11 +298,15 @@ class ConvertService : Service() {
             }
             if (candidates.isEmpty()) {
                 App.traceSafe("service:没有需要恢复的转换任务，结束服务")
+                App.instance.prefs.pendingConversion = false
+                ConversionWatchdog.cancel(this@ConvertService)
                 startBroadcast(ACTION_CONVERT_ALL_DONE)
                 stopSelf()
                 return@launch
             }
             App.traceSafe("service:恢复 ${candidates.size} 本未完成的转换")
+            App.instance.prefs.pendingConversion = true
+            ConversionWatchdog.schedule(this@ConvertService)
             val needChinese = candidates.any { it.mode.equals("chinese", ignoreCase = true) }
             ttsManager.init(if (needChinese) TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED)
             for (m in candidates) {
@@ -319,10 +327,13 @@ class ConvertService : Service() {
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
         App.traceSafe("service:任务被移除，尝试保持后台转换")
+        ensureWakeLock()
+        // 服务本身仍在前台运行，用 startService 只是补一次恢复指令，
+        // 不会触发 Android 12+ 对“后台启动前台服务”的限制。
         runCatching {
             val intent = Intent(this, ConvertService::class.java)
                 .putExtra(EXTRA_ACTION, ACTION_RESUME)
-            ContextCompat.startForegroundService(this, intent)
+            startService(intent)
         }.onFailure {
             App.traceSafe("service:任务移除后重启服务失败 ${it.javaClass.simpleName}")
         }
@@ -355,6 +366,9 @@ class ConvertService : Service() {
     /** 为一本书启动独立转换协程。 */
     private fun launchBook(uri: Uri, displayName: String, mode: TtsManager.Mode) {
         ensureWakeLock()
+        // 记录“有未完成转换”，进程被杀后下次启动会自动恢复；同时启动看门狗定时唤醒。
+        App.instance.prefs.pendingConversion = true
+        ConversionWatchdog.schedule(this)
         val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
         clearSkip(bookId)
         pausedBooks.remove(bookId)
@@ -404,8 +418,12 @@ class ConvertService : Service() {
 
     /** 所有书的协程都结束后收尾。被暂停的书协程仍在等待，不会走到这里。 */
     private fun finishBatch() {
+        if (destroying) return
         releaseWakeLock()
         val hasPaused = registry.all().any { it.status == TaskStatus.PAUSED }
+        // 正常结束或用户主动暂停：不再需要后台唤醒。
+        App.instance.prefs.pendingConversion = false
+        ConversionWatchdog.cancel(this)
         if (!cancelState.isCancelled && !hasPaused) notifyDone()
         App.traceSafe("service:全部任务结束 paused=$hasPaused")
         startBroadcast(ACTION_CONVERT_ALL_DONE)
@@ -413,6 +431,7 @@ class ConvertService : Service() {
     }
 
     override fun onDestroy() {
+        destroying = true
         cancelState.cancel()
         // 服务被系统回收（内存紧张、后台限制）时，正在转换的书不能永远停在“转换中”。
         // 统一落成“已暂停”，并把断点写回 meta，下次进入书库会自动接着转换。
@@ -614,13 +633,19 @@ class ConvertService : Service() {
                     done, total, totalSec, null, TaskStatus.PAUSED)
                 refreshNotification()
                 App.traceSafe("convert:已暂停 $title @${done + 1}/$total")
-                // 所有书都暂停时释放唤醒锁，避免无谓耗电。
-                if (runningBooks.all { isBookPaused(it) }) releaseWakeLock()
+                // 所有书都暂停时释放唤醒锁并停止看门狗，避免无谓耗电。
+                if (runningBooks.all { isBookPaused(it) }) {
+                    releaseWakeLock()
+                    ConversionWatchdog.cancel(this)
+                    App.instance.prefs.pendingConversion = false
+                }
                 while (isBookPaused(bookId)) {
                     if (cancelState.isCancelled || isBookSkipped(bookId)) break
                     delay(300)
                 }
                 ensureWakeLock()
+                App.instance.prefs.pendingConversion = true
+                ConversionWatchdog.schedule(this)
                 if (cancelState.isCancelled) {
                     registry.update(bookId) { it.copy(status = TaskStatus.CANCELLED) }
                     return

@@ -3,6 +3,7 @@ package com.ebook.voicereader
 import android.app.ActivityManager
 import android.app.Application
 import android.content.ContentValues
+import android.content.Intent
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -49,6 +50,42 @@ class App : Application() {
         installCrashHandler()
         runCatching { trace("app:onCreate · 可用内存 ${availableMemoryMB()} MB") }
         // 其余组件全部懒加载，Application 初始化不再触碰文件、模型或第三方 SDK。
+        runCatching { resumePendingConversionIfNeeded() }
+    }
+
+    /**
+     * 进程曾经被杀、但还有没转换完的书时，启动后立刻把转换服务拉起来续转。
+     * 配合看门狗，应用退出后也能继续在后台转换。
+     */
+    private fun resumePendingConversionIfNeeded() {
+        if (!prefs.pendingConversion) return
+        trace("app:检测到未完成的转换，准备恢复")
+        Thread {
+            val unfinished = runCatching {
+                cache.listAll().any {
+                    (it.status == CacheManager.Status.CONVERTING ||
+                        it.status == CacheManager.Status.PAUSED) &&
+                        !it.pausedByUser &&
+                        it.paragraphCount > 0 &&
+                        it.convertedUpTo < it.paragraphCount - 1
+                }
+            }.getOrDefault(false)
+            if (!unfinished) {
+                prefs.pendingConversion = false
+                return@Thread
+            }
+            runCatching {
+                val intent = Intent(this, com.ebook.voicereader.convert.ConvertService::class.java)
+                    .putExtra(
+                        com.ebook.voicereader.convert.ConvertService.EXTRA_ACTION,
+                        com.ebook.voicereader.convert.ConvertService.ACTION_RESUME,
+                    )
+                androidx.core.content.ContextCompat.startForegroundService(this, intent)
+                trace("app:已请求恢复后台转换")
+            }.onFailure {
+                trace("app:恢复后台转换失败 ${it.javaClass.simpleName}")
+            }
+        }.start()
     }
 
     override fun onTerminate() {

@@ -199,6 +199,9 @@ class LibraryActivity : AppCompatActivity() {
 
         binding.btnCleanCache.setOnClickListener { cleanCache() }
         binding.btnDiagnostics.setOnClickListener { showDiagnostics() }
+        binding.btnBackgroundSettings.setOnClickListener {
+            maybePromptBatteryOptimization(force = true)
+        }
     }
 
     /** Slider 的值必须落在 valueFrom + n * stepSize 上，否则会抛异常。 */
@@ -209,6 +212,11 @@ class LibraryActivity : AppCompatActivity() {
 
     private fun updateSettingsValues() {
         binding.tvCacheSize.text = getString(R.string.settings_cache_usage, cache.totalSizeMB())
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val allowed = pm?.isIgnoringBatteryOptimizations(packageName) == true
+        binding.tvBackgroundStatus.text = getString(
+            if (allowed) R.string.settings_background_allowed else R.string.settings_background_limited
+        )
         binding.radioChinese.isChecked = prefs.defaultMode != "mixed"
         binding.radioMixed.isChecked = prefs.defaultMode == "mixed"
         binding.tvWarmupValue.text = "${prefs.warmupSeconds} 秒"
@@ -256,11 +264,17 @@ class LibraryActivity : AppCompatActivity() {
      * 部分厂商系统会在退出应用后冻结后台任务。
      * 首次开始转换时提示一次，把应用加入电池优化白名单，转换才能在后台稳定继续。
      */
-    private fun maybePromptBatteryOptimization() {
-        val prefs = getSharedPreferences("ebook_ui", MODE_PRIVATE)
-        if (prefs.getBoolean("battery_prompt_done", false)) return
+    private fun maybePromptBatteryOptimization(force: Boolean = false) {
         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+            if (force) {
+                Toast.makeText(this, R.string.settings_background_allowed, Toast.LENGTH_SHORT).show()
+                updateSettingsValues()
+            }
+            return
+        }
+        val prefs = getSharedPreferences("ebook_ui", MODE_PRIVATE)
+        if (!force && prefs.getBoolean("battery_prompt_done", false)) return
         prefs.edit().putBoolean("battery_prompt_done", true).apply()
         MaterialAlertDialogBuilder(this)
             .setTitle("让转换在后台继续")
@@ -755,6 +769,7 @@ class LibraryActivity : AppCompatActivity() {
         if (tts.isReady()) binding.tvEngineHint.setText(R.string.engine_ready_short)
         updatePlayingBar()
         refreshLibrary()
+        if (binding.settingsPage.visibility == View.VISIBLE) updateSettingsValues()
         if (ConvertService.hasRunningJobs()) {
             scheduleRefreshWhileRunning()
         } else {
