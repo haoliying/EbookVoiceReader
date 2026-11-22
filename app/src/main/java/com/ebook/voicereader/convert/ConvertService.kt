@@ -277,7 +277,19 @@ class ConvertService : Service() {
      */
     private fun handleResume(): Int {
         if (hasRunningJobs()) {
+            val active = registry.all().any {
+                it.status == TaskStatus.CONVERTING || it.status == TaskStatus.PENDING
+            }
+            if (!active) {
+                // 全部是用户主动暂停的任务：不要再持锁、也不要继续排看门狗。
+                App.traceSafe("service:任务均已暂停，本次唤醒不再续期")
+                return START_STICKY
+            }
             App.traceSafe("service:收到恢复请求，任务仍在运行")
+            // 续上下一分钟的看门狗，保证进程被杀后还能再次被拉起。
+            ensureWakeLock()
+            App.instance.prefs.pendingConversion = true
+            ConversionWatchdog.schedule(this)
             return START_STICKY
         }
         resumeInterruptedFromCache()
@@ -452,6 +464,9 @@ class ConvertService : Service() {
         }
         if (interrupted.isNotEmpty()) {
             App.traceSafe("service:服务停止，${interrupted.size} 本转为暂停，可自动续转")
+            // 进程/服务即将结束，立刻安排一分钟后的唤醒，避免退出后长时间没人续转。
+            App.instance.prefs.pendingConversion = true
+            ConversionWatchdog.schedule(this)
         }
         bookJobs.values.forEach { it.cancel() }
         bookJobs.clear()

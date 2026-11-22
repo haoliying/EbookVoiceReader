@@ -108,8 +108,8 @@ class TtsManager(private val context: Context) {
     private var cache: CacheManager? = null
 
     private var listener: Listener? = null
-    private var zhEngine: OfflineTts? = null
-    private var mixedEngine: OfflineTts? = null
+    @Volatile private var zhEngine: OfflineTts? = null
+    @Volatile private var mixedEngine: OfflineTts? = null
 
     @Volatile private var ready = false
     /** 默认中文女声：模型更小、转换与播放都更快 */
@@ -134,48 +134,58 @@ class TtsManager(private val context: Context) {
     fun setCache(c: CacheManager) { cache = c }
 
     /**
-     * 按需加载模型：默认只加载双语模型；中文女声模式才额外加载小雅模型。
+     * 按需加载模型。
+     *
+     * 中文女声只加载约 20MB 的小雅模型；遇到英文段时才按需加载 170MB 双语模型。
+     * 这样中文书的常驻内存从约 190MB 降到约 20MB，后台转换不容易被系统杀掉。
      * initMutex 防止阅读页与转换服务同时重复加载同一模型。
      */
     fun init(requestedMode: Mode = mode) {
         scope.launch {
             initMutex.withLock {
-                var mixedError: String? = null
-                var zhError: String? = null
-                if (mixedEngine == null) {
-                    App.traceSafe("tts:开始加载双语模型 · 可用内存 ${App.instance.availableMemoryMB()}MB")
-                    try {
-                        mixedEngine = buildEngine(DIR_MIXED, 600)
-                        App.traceSafe("tts:双语模型加载成功 · 可用内存 ${App.instance.availableMemoryMB()}MB")
-                    } catch (e: Throwable) {
-                        mixedError = e.message ?: e.javaClass.simpleName
-                        App.traceSafe("tts:双语模型加载失败 ${e.javaClass.name}: ${e.message}")
+                if (requestedMode == Mode.CHINESE) {
+                    var zhError: String? = null
+                    if (zhEngine == null) {
+                        App.traceSafe("tts:开始加载中文模型 · 可用内存 ${App.instance.availableMemoryMB()}MB")
+                        try {
+                            zhEngine = buildEngine(DIR_ZH, 300)
+                            App.traceSafe("tts:中文模型加载成功 · 可用内存 ${App.instance.availableMemoryMB()}MB")
+                        } catch (e: Throwable) {
+                            zhError = e.message ?: e.javaClass.simpleName
+                            App.traceSafe("tts:中文模型加载失败 ${e.javaClass.name}: ${e.message}")
+                        }
                     }
-                }
-                // 中文模式需要双语模型兜底英文；双语模型不可用时不再浪费内存加载另一套。
-                if (requestedMode == Mode.CHINESE && mixedEngine != null && zhEngine == null) {
-                    try {
-                        zhEngine = buildEngine(DIR_ZH, 300)
-                        App.traceSafe("tts:中文模型加载成功")
-                    } catch (e: Throwable) {
-                        zhError = e.message ?: e.javaClass.simpleName
-                        App.traceSafe("tts:中文模型加载失败 ${e.javaClass.name}: ${e.message}")
-                    }
-                }
-
-                ready = mixedEngine != null
-                if (ready) {
-                    val info = if (zhEngine != null) {
-                        "内置离线语音已就绪 · 中英混读 / 中文女声"
+                    ready = zhEngine != null
+                    if (ready) {
+                        notify { it.onEngineReady("内置离线语音已就绪 · 中文女声") }
                     } else {
-                        "内置离线语音已就绪 · 中英混读"
+                        notify {
+                            it.onEngineUnavailable(
+                                "内置语音引擎加载失败：${zhError ?: "未知错误"}"
+                            )
+                        }
                     }
-                    notify { it.onEngineReady(info) }
                 } else {
-                    notify {
-                        it.onEngineUnavailable(
-                            "内置语音引擎加载失败：${mixedError ?: zhError ?: "未知错误"}"
-                        )
+                    var mixedError: String? = null
+                    if (mixedEngine == null) {
+                        App.traceSafe("tts:开始加载双语模型 · 可用内存 ${App.instance.availableMemoryMB()}MB")
+                        try {
+                            mixedEngine = buildEngine(DIR_MIXED, 600)
+                            App.traceSafe("tts:双语模型加载成功 · 可用内存 ${App.instance.availableMemoryMB()}MB")
+                        } catch (e: Throwable) {
+                            mixedError = e.message ?: e.javaClass.simpleName
+                            App.traceSafe("tts:双语模型加载失败 ${e.javaClass.name}: ${e.message}")
+                        }
+                    }
+                    ready = mixedEngine != null
+                    if (ready) {
+                        notify { it.onEngineReady("内置离线语音已就绪 · 中英混读") }
+                    } else {
+                        notify {
+                            it.onEngineUnavailable(
+                                "内置语音引擎加载失败：${mixedError ?: "未知错误"}"
+                            )
+                        }
                     }
                 }
             }
@@ -530,6 +540,8 @@ class TtsManager(private val context: Context) {
         val out = mutableListOf<PreparedChunk>()
         for (chunk in splitChunks(text)) {
             for ((chinese, part) in segmentsOf(chunk, modeOverride)) {
+                // 中文模式平时只驻留 20MB 的小雅模型；真的遇到英文段才补载双语模型。
+                if (modeOverride == Mode.CHINESE && !chinese) ensureMixedEngine()
                 val engine = engineFor(modeOverride, chinese)
                     ?: throw IllegalStateException("所选语音模式的模型尚未加载")
                 val audio = engineMutex.withLock {
@@ -546,9 +558,30 @@ class TtsManager(private val context: Context) {
     private suspend fun prepareParagraph(text: String, mySession: Int) =
         synthesize(text, mode, mySession)
 
+    private suspend fun ensureMixedEngine(): OfflineTts? {
+        mixedEngine?.let { return it }
+        return initMutex.withLock {
+            mixedEngine ?: run {
+                App.traceSafe("tts:遇到英文段落，按需加载双语模型")
+                val built = try {
+                    buildEngine(DIR_MIXED, 300)
+                } catch (e: Throwable) {
+                    App.traceSafe("tts:双语模型按需加载失败 ${e.javaClass.name}: ${e.message}")
+                    null
+                }
+                if (built != null) {
+                    mixedEngine = built
+                    App.traceSafe("tts:双语模型按需加载成功")
+                }
+                built
+            }
+        }
+    }
+
     private fun engineFor(m: Mode, chinese: Boolean): OfflineTts? = when (m) {
         Mode.MIXED -> mixedEngine ?: if (chinese) zhEngine else null
-        Mode.CHINESE -> if (chinese) zhEngine ?: mixedEngine else mixedEngine
+        // 双语模型不可用时退回中文模型，宁可发音略差也不要让整段失败。
+        Mode.CHINESE -> if (chinese) zhEngine ?: mixedEngine else mixedEngine ?: zhEngine
     }
 
     private fun segmentsOf(chunk: String, selectedMode: Mode): List<Pair<Boolean, String>> =

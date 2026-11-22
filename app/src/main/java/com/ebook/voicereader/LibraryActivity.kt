@@ -578,6 +578,14 @@ class LibraryActivity : AppCompatActivity() {
     private fun startConvertService(uris: List<Uri>, mode: String) {
         App.traceSafe("library:选择 ${uris.size} 个文件，模式=$mode")
         maybePromptBatteryOptimization()
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        if (pm?.isIgnoringBatteryOptimizations(packageName) != true) {
+            Toast.makeText(
+                this,
+                "提示：在「设置 → 后台转换」允许后台运行，退出应用后才能继续转换",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
         val names = uris.map { getDisplayName(it) }
         val tasks = uris.mapIndexed { i, uri ->
             TaskInfo(
