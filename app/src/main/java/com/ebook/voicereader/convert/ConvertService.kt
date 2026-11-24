@@ -29,7 +29,6 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 
 /**
@@ -136,13 +135,14 @@ class ConvertService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val cancelState = CancelState()
-    private val activeJobs = AtomicInteger(0)
 
     /**
-     * 同时推进的书籍数上限。语音推理本身已被 TtsManager.engineMutex 串行化，
-     * 这里限流主要是避免多本大 PDF 同时解析把内存吃满。
+     * 转换队列：所有待转换的书按入队顺序串行执行，一次只转一本。
+     * 并发模式下用户反馈容易被系统杀掉且难以追踪进度，改为顺序转换。
      */
-    private val convertSlots = Semaphore(2)
+    private val taskQueue = ArrayDeque<QueueItem>()
+    @Volatile private var isProcessing = false
+    private data class QueueItem(val uri: Uri, val displayName: String, val mode: TtsManager.Mode)
 
     /**
      * 解析阶段单独串行：大 PDF 解析的内存峰值远高于合成，
@@ -216,6 +216,7 @@ class ConvertService : Service() {
         }
         if (intent.getStringExtra(EXTRA_ACTION) == ACTION_CANCEL) {
             cancelState.cancel()
+            taskQueue.clear()
             registry.markAllCancelled()
             App.instance.prefs.pendingConversion = false
             ConversionWatchdog.cancel(this)
@@ -259,12 +260,21 @@ class ConvertService : Service() {
         ttsManager.init(mode)
         App.traceSafe("service:已请求加载语音引擎")
 
-        // 并发转换：每本书一个协程，互不影响。点开正在转换的书可以直接听，
-        // 暂停其中一本也不会拖住其他书。
+        // 顺序转换：所有书入队，一次只转一本，避免并发解析大文件 OOM。
+        // 队列中排在后面的书状态为 PENDING，当前这本跑完自动接下一本。
         for ((idx, uri) in uris.withIndex()) {
             val displayName = names.getOrNull(idx) ?: "文件${idx + 1}"
-            launchBook(uri, displayName, mode)
+            val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
+            taskQueue.addLast(QueueItem(uri, displayName, mode))
+            registry.ensure(
+                TaskInfo(
+                    bookId = bookId, title = displayName, uri = uri.toString(),
+                    mode = mode.name.lowercase(), total = 0, done = -1,
+                    status = TaskStatus.PENDING, totalSeconds = 0f,
+                )
+            )
         }
+        drainQueue()
 
         // 用 START_STICKY：用户退出应用或进程被系统回收后，服务会被重建，
         // 重建时会走 handleResume() 从断点继续转换，而不是停在前台通知里。
@@ -321,6 +331,7 @@ class ConvertService : Service() {
             ConversionWatchdog.schedule(this@ConvertService)
             val needChinese = candidates.any { it.mode.equals("chinese", ignoreCase = true) }
             ttsManager.init(if (needChinese) TtsManager.Mode.CHINESE else TtsManager.Mode.MIXED)
+            // 顺序恢复：所有候选入队，一次只转一本。
             for (m in candidates) {
                 val uri = runCatching { Uri.parse(m.sourceUri) }.getOrNull() ?: continue
                 val mode = if (m.mode.equals("chinese", ignoreCase = true)) {
@@ -328,8 +339,17 @@ class ConvertService : Service() {
                 } else {
                     TtsManager.Mode.MIXED
                 }
-                launchBook(uri, m.title, mode)
+                val bookId = CacheManager.idOf(uri.toString() + ":" + mode.name)
+                taskQueue.addLast(QueueItem(uri, m.title, mode))
+                registry.ensure(
+                    TaskInfo(
+                        bookId = bookId, title = m.title, uri = uri.toString(),
+                        mode = mode.name.lowercase(), total = m.paragraphCount, done = m.convertedUpTo,
+                        status = TaskStatus.PENDING, totalSeconds = m.totalSeconds,
+                    )
+                )
             }
+            drainQueue()
         }
     }
 
@@ -375,6 +395,55 @@ class ConvertService : Service() {
         }
     }
 
+    /**
+     * 串行队列调度器：取队头的一本书启动转换。
+     * 每本书的 finally 里会再次调用它启动下一本。
+     */
+    private fun drainQueue() {
+        App.traceSafe("convert:drainQueue queue=${taskQueue.size} isProcessing=$isProcessing")
+        if (cancelState.isCancelled) {
+            App.traceSafe("convert:已取消，清空队列剩余 ${taskQueue.size} 本")
+            taskQueue.clear()
+            for (task in registry.all()) {
+                if (task.status == TaskStatus.PENDING) {
+                    registry.update(task.bookId) { it.copy(status = TaskStatus.CANCELLED) }
+                }
+            }
+            // 全部取消时直接 finishBatch
+            val allNonRunning = !hasRunningJobs()
+            if (allNonRunning) finishBatch()
+            return
+        }
+        if (isProcessing) return
+        // 跳过已被用户删除的书（还在队列里没开始转的）
+        var next: QueueItem? = null
+        while (taskQueue.isNotEmpty()) {
+            val candidate = taskQueue.removeFirstOrNull() ?: break
+            val candidateBookId = CacheManager.idOf(candidate.uri.toString() + ":" + candidate.mode.name)
+            if (isBookSkipped(candidateBookId)) {
+                App.traceSafe("convert:跳过已删除的队列项 ${candidate.displayName}")
+                continue
+            }
+            next = candidate
+            break
+        }
+        if (next == null) {
+            // 队列空了：如果没有正在运行的也没有暂停的，就 finishBatch。
+            val hasPaused = registry.all().any { it.status == TaskStatus.PAUSED }
+            if (!hasPaused && !hasRunningJobs()) {
+                finishBatch()
+            } else {
+                App.traceSafe("convert:队列空但仍有暂停/运行任务 暂停=$hasPaused running=${hasRunningJobs()}")
+                refreshNotification()
+            }
+            return
+        }
+        isProcessing = true
+        App.traceSafe("convert:取出队头 ${next.displayName} 剩余 ${taskQueue.size}")
+        launchBook(next.uri, next.displayName, next.mode)
+        refreshNotification()
+    }
+
     /** 为一本书启动独立转换协程。 */
     private fun launchBook(uri: Uri, displayName: String, mode: TtsManager.Mode) {
         ensureWakeLock()
@@ -388,7 +457,6 @@ class ConvertService : Service() {
         runningBooks.add(bookId)
         // 同一本书重复点击时先取消旧任务，避免两个协程同时写同一本书。
         bookJobs.remove(bookId)?.cancel()
-        activeJobs.incrementAndGet()
 
         bookJobs[bookId] = scope.launch {
             try {
@@ -423,7 +491,9 @@ class ConvertService : Service() {
                 }
                 runningBooks.remove(bookId)
                 bookJobs.remove(bookId)
-                if (activeJobs.decrementAndGet() == 0) finishBatch()
+                // 串行：当前这本跑完了，排下一本。队列空且无暂停任务时 finishBatch。
+                isProcessing = false
+                drainQueue()
             }
         }
     }
@@ -687,7 +757,7 @@ class ConvertService : Service() {
             while (attempt < 3 && result == null) {
                 if (attempt > 0) delay(500L * attempt)
                 if (isBookSkipped(bookId) || cancelState.isCancelled) return
-                result = convertSlots.withPermit { ttsManager.synthesizeParagraph(text, mode) }
+                result = ttsManager.synthesizeParagraph(text, mode)
                 if (result == null) {
                     App.traceSafe(
                         "convert:合成失败 段=$i 第${attempt + 1}次 " +
@@ -904,22 +974,31 @@ class ConvertService : Service() {
 
     /** 并发转换时通知栏展示汇总进度，而不是被多本书来回覆盖。 */
     private fun refreshNotification() {
-        val running = registry.all().filter {
+        val allActive = registry.all().filter {
             it.status == TaskStatus.CONVERTING ||
                 it.status == TaskStatus.PAUSED ||
                 it.status == TaskStatus.PENDING
         }
-        if (running.isEmpty()) return
-        val total = running.sumOf { it.total }
-        val done = running.sumOf { (it.done + 1).coerceAtLeast(0) }
-        val paused = running.count { it.status == TaskStatus.PAUSED }
+        if (allActive.isEmpty()) return
+        val converting = allActive.firstOrNull { it.status == TaskStatus.CONVERTING }
+        val queueSize = taskQueue.size
+        val paused = allActive.count { it.status == TaskStatus.PAUSED }
         val title = when {
-            paused == running.size -> "转换已暂停"
-            paused > 0 -> "正在转换 ${running.size - paused} 本 · 暂停 $paused 本"
-            else -> "正在转换 ${running.size} 本书"
+            paused == allActive.size -> "转换已暂停"
+            converting != null -> "正在转换《${converting.title}》" + if (queueSize > 0) " · 队列 $queueSize 本" else ""
+            else -> "转换中 · 队列 $queueSize 本"
         }
-        val text = if (total > 0) "已完成 $done/$total 段 · 退出应用后仍会继续" else "正在解析…"
-        updateNotification(title, text, done, total)
+        val text = if (converting != null && converting.total > 0) {
+            val done = (converting.done + 1).coerceAtLeast(0)
+            "${done}/${converting.total} 段 · 退出应用后仍会继续"
+        } else if (converting != null) {
+            "正在解析 ${converting.title}…"
+        } else {
+            "等待恢复…"
+        }
+        val progTotal = converting?.total ?: 0
+        val progDone = (converting?.done?.plus(1) ?: 0).coerceAtLeast(0)
+        updateNotification(title, text, progDone, progTotal)
     }
 
     private fun notifyError(message: String) {

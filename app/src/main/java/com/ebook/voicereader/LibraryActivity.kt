@@ -683,6 +683,22 @@ class LibraryActivity : AppCompatActivity() {
             Toast.makeText(this, "原文件不可用：${item.title}", Toast.LENGTH_LONG).show()
             return
         }
+        // 转换与播放分离：只有转换完成的书才能进入朗读页。
+        // 正在后台播放的书（tts 持有 currentBookId）允许继续。
+        val currentPlaying = tts.currentBookId()
+        val isSameBookPlaying = currentPlaying == item.bookId && (tts.isPlaying() || tts.isPaused())
+        if (item.status != ItemStatus.DONE && !isSameBookPlaying) {
+            val msg = when (item.status) {
+                ItemStatus.CONVERTING -> getString(R.string.open_converting_now, item.title)
+                ItemStatus.PENDING -> getString(R.string.open_converting_pending, item.title)
+                ItemStatus.PAUSED -> getString(R.string.open_converting_paused, item.title)
+                ItemStatus.FAILED -> getString(R.string.open_converting_failed, item.title)
+                ItemStatus.PARTIAL -> getString(R.string.open_converting_partial, item.title)
+                ItemStatus.DONE -> ""
+            }
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            return
+        }
         val uri = runCatching { Uri.parse(item.sourceUri) }.getOrNull() ?: return
         openReaderFor(uri, item.bookId, item.title)
     }
