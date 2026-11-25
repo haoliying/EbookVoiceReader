@@ -11,6 +11,9 @@ import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.media.MediaPlayer
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
@@ -19,6 +22,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.ebook.voicereader.App
+import com.ebook.voicereader.R
 import com.ebook.voicereader.cache.CacheManager
 import com.ebook.voicereader.model.Book
 import com.ebook.voicereader.reader.DocumentReaderFactory
@@ -174,6 +178,9 @@ class ConvertService : Service() {
      */
     private var keepAliveTrack: AudioTrack? = null
     private var keepAliveJob: Job? = null
+    /** MediaPlayer + MediaSession：让系统把本应用识别为「正在播放音乐」，息屏不被冻结 */
+    private var keepAlivePlayer: MediaPlayer? = null
+    private var keepAliveSession: MediaSession? = null
     /** onDestroy 期间会取消任务，此时不能把 pending 标记清掉，否则无法自动续转 */
     @Volatile private var destroying = false
 
@@ -416,6 +423,7 @@ class ConvertService : Service() {
     private fun ensureWakeLock() {
         // 放在最前面：中间分支有非局部 return，避免跳过静音保活的重试。
         startAudioKeepAlive()
+        startMediaKeepAlive()
         runCatching {
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: run {
                 App.traceSafe("service:PowerManager 不可用，无法获取唤醒锁")
@@ -447,6 +455,69 @@ class ConvertService : Service() {
             wakeLock = null
         }
         stopAudioKeepAlive()
+        stopMediaKeepAlive()
+    }
+
+    /**
+     * 媒体保活：用 MediaPlayer 循环播放一段极低振幅音频，并建立 MediaSession 置为 PLAYING。
+     * 国产 ROM / 鸿蒙卓易通判断「应用是否在播放音乐」主要看 MediaSession 与媒体流是否活跃，
+     * 只有 MediaSession 活跃的应用才会被排除在息屏清理之外，单纯 AudioTrack 静音经常不算。
+     * 每次调用都会检查播放器是否被系统停掉，被停掉就重启。幂等。
+     */
+    private fun startMediaKeepAlive() {
+        val playing = runCatching { keepAlivePlayer?.isPlaying == true }.getOrDefault(false)
+        if (playing) return
+        runCatching { keepAlivePlayer?.release() }
+        keepAlivePlayer = null
+        runCatching { keepAliveSession?.release() }
+        keepAliveSession = null
+        runCatching {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+            val player = MediaPlayer()
+            player.setAudioAttributes(attrs)
+            player.setDataSource(
+                this, Uri.parse("android.resource://$packageName/${R.raw.convert_keepalive}")
+            )
+            player.isLooping = true
+            // 音频本身已是极低振幅，再压到 1% 音量，输出约 -70dBFS，人耳不可闻
+            player.setVolume(0.01f, 0.01f)
+            player.prepare()
+            player.start()
+            keepAlivePlayer = player
+
+            val session = MediaSession(this, "EbookVoiceReaderConvert")
+            session.setPlaybackState(
+                PlaybackState.Builder()
+                    .setState(
+                        PlaybackState.STATE_PLAYING,
+                        PlaybackState.PLAYBACK_POSITION_UNKNOWN,
+                        1f,
+                    )
+                    .setActions(PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE)
+                    .build()
+            )
+            session.isActive = true
+            keepAliveSession = session
+            App.traceSafe("service:媒体保活已启动（MediaSession=PLAYING）")
+        }.onFailure {
+            App.traceSafe("service:媒体保活启动失败 ${it.message}")
+        }
+    }
+
+    private fun stopMediaKeepAlive() {
+        runCatching {
+            keepAliveSession?.isActive = false
+            keepAliveSession?.release()
+        }
+        keepAliveSession = null
+        runCatching {
+            keepAlivePlayer?.stop()
+            keepAlivePlayer?.release()
+        }
+        keepAlivePlayer = null
     }
 
     /**
@@ -1109,7 +1180,8 @@ class ConvertService : Service() {
         }
         val text = if (converting != null && converting.total > 0) {
             val done = (converting.done + 1).coerceAtLeast(0)
-            "${done}/${converting.total} 段 · 退出应用后仍会继续"
+            val tag = if (keepAlivePlayer != null) " · 息屏保活中" else ""
+            "${done}/${converting.total} 段$tag"
         } else if (converting != null) {
             "正在解析 ${converting.title}…"
         } else {
