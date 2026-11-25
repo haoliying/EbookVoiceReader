@@ -75,11 +75,12 @@
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize" />
 
+        <!-- 只用 specialUse：dataSync 在 Android 14+ 需要额外权限且后台启动会被拒绝 -->
         <service
             android:name=".convert.ConvertService"
             android:exported="false"
             android:stopWithTask="false"
-            android:foregroundServiceType="specialUse|dataSync">
+            android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="后台转换电子书为离线语音"/>
