@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
@@ -265,15 +266,51 @@ class LibraryActivity : AppCompatActivity() {
      * 首次开始转换时提示一次，把应用加入电池优化白名单，转换才能在后台稳定继续。
      */
     private fun maybePromptBatteryOptimization(force: Boolean = false) {
-        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-        if (pm.isIgnoringBatteryOptimizations(packageName)) {
+        val prefs = getSharedPreferences("ebook_ui", MODE_PRIVATE)
+        val brand = DeviceBranding.current
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val ignoringBattery = pm?.isIgnoringBatteryOptimizations(packageName) == true
+
+        // 鸿蒙卓易通 / 华为：电池白名单不够，必须开自启动 + 后台弹出界面
+        if (brand == DeviceBranding.Brand.HARMONY || brand == DeviceBranding.Brand.HUAWEI) {
+            if (!force && prefs.getBoolean("harmony_guide_done", false)) return
+            prefs.edit().putBoolean("harmony_guide_done", true).apply()
+            val title = if (brand == DeviceBranding.Brand.HARMONY) "鸿蒙手机息屏转换设置" else "华为手机息屏转换设置"
+            val msg = if (brand == DeviceBranding.Brand.HARMONY) {
+                "鸿蒙对后台应用限制很严，息屏后转换会被直接挂起。\n" +
+                    "请依次打开以下 3 项，才能息屏继续转换：\n\n" +
+                    "① 自启动：设置 → 应用和服务 → 自启动管理 → 开启朗读时光\n" +
+                    "② 后台弹出界面：设置 → 应用和服务 → 朗读时光 → 后台弹出界面 → 允许\n" +
+                    "③ 电池白名单：设置 → 电池 → 耗电保护 → 朗读时光 → 不限制"
+            } else {
+                "华为手机对后台限制很严，息屏后转换会被挂起。\n" +
+                    "请依次打开以下 3 项：\n\n" +
+                    "① 自启动：设置 → 应用和服务 → 自启动管理 → 开启朗读时光\n" +
+                    "② 后台弹出界面：设置 → 应用和服务 → 朗读时光 → 后台弹出界面 → 允许\n" +
+                    "③ 电池白名单：设置 → 电池 → 启动管理 → 朗读时光 → 不限制"
+            }
+            MaterialAlertDialogBuilder(this)
+                .setTitle(title)
+                .setMessage(msg)
+                .setPositiveButton("一步到位") { _, _ ->
+                    launchHarmonyAutoStart()
+                }
+                .setNeutralButton("去电池设置") { _, _ ->
+                    openBatteryOptimization()
+                }
+                .setNegativeButton(R.string.cancel, null)
+                .show()
+            return
+        }
+
+        // 其他品牌：先看电池白名单
+        if (ignoringBattery) {
             if (force) {
                 Toast.makeText(this, R.string.settings_background_allowed, Toast.LENGTH_SHORT).show()
                 updateSettingsValues()
             }
             return
         }
-        val prefs = getSharedPreferences("ebook_ui", MODE_PRIVATE)
         if (!force && prefs.getBoolean("battery_prompt_done", false)) return
         prefs.edit().putBoolean("battery_prompt_done", true).apply()
         MaterialAlertDialogBuilder(this)
@@ -282,20 +319,52 @@ class LibraryActivity : AppCompatActivity() {
                 "部分手机在退出应用后会限制后台任务。把「朗读时光」加入电池优化白名单，" +
                     "退出应用后转换才能继续。"
             )
-            .setPositiveButton("去设置") { _, _ ->
-                runCatching {
-                    startActivity(
-                        Intent(
-                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                            Uri.parse("package:$packageName"),
-                        )
-                    )
-                }.onFailure {
-                    Toast.makeText(this, "请在系统设置中允许后台运行", Toast.LENGTH_LONG).show()
-                }
-            }
+            .setPositiveButton("去设置") { _, _ -> openBatteryOptimization() }
             .setNegativeButton(R.string.cancel, null)
             .show()
+    }
+
+    private fun openBatteryOptimization() {
+        runCatching {
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName"),
+                )
+            )
+        }.onFailure {
+            runCatching {
+                startActivity(Intent(Settings.ACTION_SETTINGS))
+            }
+        }
+    }
+
+    /** 鸿蒙卓易通 / 华为：尝试直达自启动管理页；失败则跳到应用详情 */
+    private fun launchHarmonyAutoStart() {
+        val intents = listOf(
+            // 华为自启动管理
+            Intent().apply {
+                component = android.content.ComponentName(
+                    "com.huawei.systemmanager",
+                    "com.huawei.systemmanager.optimize.process.ProtectActivity",
+                )
+            },
+            // 鸿蒙应用启动管理
+            Intent("com.huawei.systemmanager.action.PROTECTED_APPS"),
+            // 通用应用详情
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")),
+        )
+        for (intent in intents) {
+            if (runCatching { startActivity(intent); true }.getOrDefault(false)) {
+                Toast.makeText(
+                    this,
+                    "请找到「朗读时光」开启自启动、后台弹出界面、电池白名单",
+                    Toast.LENGTH_LONG,
+                ).show()
+                return
+            }
+        }
+        Toast.makeText(this, "请在系统设置 → 应用和服务中手动开启权限", Toast.LENGTH_LONG).show()
     }
 
     /** 长按书籍卡片：按当前状态提供暂停 / 继续转换 / 删除。 */
@@ -579,7 +648,30 @@ class LibraryActivity : AppCompatActivity() {
         App.traceSafe("library:选择 ${uris.size} 个文件，模式=$mode")
         maybePromptBatteryOptimization()
         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
-        if (pm?.isIgnoringBatteryOptimizations(packageName) != true) {
+        val ignoring = pm?.isIgnoringBatteryOptimizations(packageName) == true
+        val brand = DeviceBranding.current
+        if (brand == DeviceBranding.Brand.HARMONY || brand == DeviceBranding.Brand.HUAWEI) {
+            // 鸿蒙/华为：息屏后 PARTIAL_WAKE_LOCK 会被直接丢弃，必须引导开自启动
+            runCatching {
+                startActivity(Intent().apply {
+                    component = android.content.ComponentName(
+                        "com.huawei.systemmanager",
+                        "com.huawei.systemmanager.optimize.process.ProtectActivity",
+                    )
+                })
+                Toast.makeText(
+                    this,
+                    "请开启朗读时光的自启动和后台弹出界面，否则息屏会停止转换",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }.onFailure {
+                Toast.makeText(
+                    this,
+                    "鸿蒙/华为：息屏会停止转换，请先在「设置→后台转换」开权限",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        } else if (!ignoring) {
             Toast.makeText(
                 this,
                 "提示：在「设置 → 后台转换」允许后台运行，退出应用后才能继续转换",
@@ -914,4 +1006,46 @@ class LibraryAdapter(
             b.root.setOnLongClickListener { onLongClick(item); true }
         }
     }
+}
+
+/**
+ * 设备品牌检测 & 厂商后台权限设置页跳转。
+ * 国产 ROM 对后台限制远严于原生 Android：鸿蒙卓易通、小米 MIUI、华为 EMUI 等，
+ * 即使前台服务 + PARTIAL_WAKE_LOCK，息屏后 CPU 也会被 Doze 挂起。
+ * 必须引导用户打开「自启动」「后台弹出界面」「电池白名单」才能息屏继续转换。
+ */
+object DeviceBranding {
+    enum class Brand { HARMONY, HUAWEI, XIAOMI, OPPO, VIVO, OTHER }
+
+    val current: Brand by lazy {
+        val brand = Build.BRAND?.lowercase().orEmpty()
+        val manufacturer = Build.MANUFACTURER?.lowercase().orEmpty()
+        // 鸿蒙卓易通检测：Build.DISPLAY 含 "Harmony" 或 Build.HARDWARE 含 "ohos"
+        val display = Build.DISPLAY?.lowercase().orEmpty()
+        val hardware = Build.HARDWARE?.lowercase().orEmpty()
+        val tags = Build.TAGS?.lowercase().orEmpty()
+        // 反射读系统属性（hidden API，不能直接调用）
+        val harmonyVersion = runCatching {
+            val cls = Class.forName("android.os.SystemProperties")
+            val get = cls.getMethod("get", String::class.java)
+            get.invoke(null, "ro.build.version.harmonyos") as? String ?: ""
+        }.getOrDefault("")
+        val isHarmony = display.contains("harmony") || hardware.contains("ohos") ||
+            tags.contains("ohos") || harmonyVersion.isNotEmpty()
+        when {
+            isHarmony -> Brand.HARMONY
+            brand.contains("huawei") || manufacturer.contains("huawei") -> Brand.HUAWEI
+            brand.contains("xiaomi") || manufacturer.contains("xiaomi") ||
+                brand.contains("redmi") -> Brand.XIAOMI
+            brand.contains("oppo") || manufacturer.contains("oppo") ||
+                brand.contains("oneplus") -> Brand.OPPO
+            brand.contains("vivo") || manufacturer.contains("vivo") ||
+                brand.contains("iqoo") -> Brand.VIVO
+            else -> Brand.OTHER
+        }
+    }
+
+    /** 当前设备是否对后台限制特别严（需要额外引导自启动） */
+    val needsAutoStartGuide: Boolean
+        get() = current in setOf(Brand.HARMONY, Brand.HUAWEI, Brand.XIAOMI, Brand.OPPO, Brand.VIVO)
 }

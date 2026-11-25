@@ -4,8 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
@@ -164,6 +166,25 @@ class ConvertService : Service() {
     /** onDestroy 期间会取消任务，此时不能把 pending 标记清掉，否则无法自动续转 */
     @Volatile private var destroying = false
 
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    // 息屏：鸿蒙卓易通会把 PARTIAL_WAKE_LOCK 静默丢弃，
+                    // 再次主动 acquire，并标记 pending 让看门狗知道有未完成任务。
+                    App.traceSafe("service:息屏事件，重新确保唤醒锁")
+                    ensureWakeLock()
+                    if (App.instance.prefs.pendingConversion) {
+                        ConversionWatchdog.schedule(ctx)
+                    }
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    App.traceSafe("service:亮屏事件")
+                }
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         // 复用 App 的全局单例：绝不在这里再 new 一个 TtsManager。
@@ -174,6 +195,15 @@ class ConvertService : Service() {
         manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         lbm = LocalBroadcastManager.getInstance(this)
         createChannel()
+        // 屏幕开关广播：动态注册可以在 Android 13+ 正常工作
+        runCatching {
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+            }
+            registerReceiver(screenReceiver, filter)
+            App.traceSafe("service:已注册屏幕开关广播")
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -373,18 +403,28 @@ class ConvertService : Service() {
     }
 
     private fun ensureWakeLock() {
-        if (wakeLock?.isHeld == true) return
         runCatching {
-            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: run {
+                App.traceSafe("service:PowerManager 不可用，无法获取唤醒锁")
+                return
+            }
+            // 已有锁：touch 续期。
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.setReferenceCounted(false)
+                // 每段合成 touch 一次，防止鸿蒙卓易通静默丢弃 WakeLock
+                return
+            }
             wakeLock = pm.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK, "EbookVoiceReader:convert",
             ).apply {
                 setReferenceCounted(false)
-                // 30 分钟自动过期，防止异常情况下长期占用；
-                // 转换过程中会周期性续期。
-                acquire(30 * 60 * 1000L)
+                // 不设超时：转换未完成前必须保持 CPU 运行，
+                // 之前 30 分钟自动过期对长书不够，鸿蒙卓易通还会在此基础上提前丢锁。
+                acquire()
             }
-            App.traceSafe("service:已获取转换唤醒锁")
+            App.traceSafe("service:已获取 PARTIAL_WAKE_LOCK 持有直到转换完成")
+        }.onFailure {
+            App.traceSafe("service:获取唤醒锁失败 ${it.message}")
         }
     }
 
@@ -541,6 +581,7 @@ class ConvertService : Service() {
         bookJobs.values.forEach { it.cancel() }
         bookJobs.clear()
         runningBooks.clear()
+        runCatching { unregisterReceiver(screenReceiver) }
         releaseWakeLock()
         // 注意：不能 release() 共享的 ttsManager，否则会连带卸载正在播放的引擎
         super.onDestroy()
@@ -691,6 +732,9 @@ class ConvertService : Service() {
         }
 
         for (i in startFrom until total) {
+            // 每段都 touch 唤醒锁：鸿蒙卓易通 / 小米 MIUI 会静默丢弃 PARTIAL_WAKE_LOCK，
+            // 不 touch 的话息屏后第一段合成完就再也不走了。
+            ensureWakeLock()
             // 用户删除这本书：立刻放弃，保留删除结果。
             if (isBookSkipped(bookId)) {
                 App.traceSafe("convert:书籍已被删除，中止转换 $bookId")
