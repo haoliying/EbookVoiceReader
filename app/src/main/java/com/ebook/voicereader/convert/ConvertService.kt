@@ -8,6 +8,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
@@ -26,6 +29,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -163,6 +167,13 @@ class ConvertService : Service() {
      * 转换期间持有 PARTIAL_WAKE_LOCK，才能退出应用、锁屏后继续合成。
      */
     private var wakeLock: PowerManager.WakeLock? = null
+    /**
+     * 静音音频保活：息屏后 CPU 会被系统挂起，而 PARTIAL_WAKE_LOCK 在鸿蒙卓易通等
+     * 国产 ROM 上经常被静默忽略。持续播放 0 音量的静音 PCM 会让系统认为进程在
+     * 播放音频，从而保持进程活跃，用户不需要去开自启动 / 电池白名单。
+     */
+    private var keepAliveTrack: AudioTrack? = null
+    private var keepAliveJob: Job? = null
     /** onDestroy 期间会取消任务，此时不能把 pending 标记清掉，否则无法自动续转 */
     @Volatile private var destroying = false
 
@@ -403,6 +414,8 @@ class ConvertService : Service() {
     }
 
     private fun ensureWakeLock() {
+        // 放在最前面：中间分支有非局部 return，避免跳过静音保活的重试。
+        startAudioKeepAlive()
         runCatching {
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: run {
                 App.traceSafe("service:PowerManager 不可用，无法获取唤醒锁")
@@ -433,6 +446,68 @@ class ConvertService : Service() {
             if (wakeLock?.isHeld == true) wakeLock?.release()
             wakeLock = null
         }
+        stopAudioKeepAlive()
+    }
+
+    /**
+     * 循环播放 0 音量静音 PCM。系统认为进程在播放音频，息屏后也不会挂起，
+     * 这是鸿蒙卓易通这类无法访问系统后台设置时最有效的保活手段。幂等。
+     */
+    private fun startAudioKeepAlive() {
+        if (keepAliveTrack != null) return
+        runCatching {
+            val sampleRate = 8000
+            val minBuf = AudioTrack.getMinBufferSize(
+                sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
+            )
+            if (minBuf <= 0) {
+                App.traceSafe("service:静音保活不可用 minBuf=$minBuf")
+                return
+            }
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBuf * 2)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            track.setVolume(0f)
+            track.play()
+            keepAliveTrack = track
+            val silence = ByteArray(minBuf)
+            keepAliveJob = scope.launch {
+                while (isActive) {
+                    val t = keepAliveTrack ?: break
+                    val written = runCatching { t.write(silence, 0, silence.size) }.getOrDefault(-1)
+                    if (written < 0) break
+                }
+            }
+            App.traceSafe("service:已启动静音音频保活，息屏不会中断转换")
+        }.onFailure {
+            App.traceSafe("service:静音保活启动失败 ${it.message}")
+        }
+    }
+
+    private fun stopAudioKeepAlive() {
+        runCatching { keepAliveJob?.cancel() }
+        keepAliveJob = null
+        runCatching {
+            keepAliveTrack?.let {
+                runCatching { it.stop() }
+                runCatching { it.release() }
+            }
+        }
+        keepAliveTrack = null
     }
 
     /**
