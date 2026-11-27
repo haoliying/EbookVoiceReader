@@ -6,13 +6,15 @@ plugins {
 android {
     namespace = "com.ebook.voicereader"
     compileSdk = 34
+    // 用于编译 MP3 编码器（LAME 静态库 + JNI 桥）
+    ndkVersion = "25.2.9519653"
 
     defaultConfig {
         applicationId = "com.ebook.voicereader"
         minSdk = 24
         targetSdk = 34
-        versionCode = 34
-        versionName = "6.0"
+        versionCode = 35
+        versionName = "6.1"
 
         ndk {
             // sherpa-onnx 内置预编译 so，覆盖主流真机与 x86_64 模拟器
@@ -53,6 +55,11 @@ android {
     buildFeatures {
         viewBinding = true
         buildConfig = true
+    }
+    externalNativeBuild {
+        ndkBuild {
+            path = file("src/main/jni/Android.mk")
+        }
     }
     androidResources {
         // 模型与词典需以未压缩方式打包，供原生层直接读取

@@ -70,12 +70,14 @@ class LibraryActivity : AppCompatActivity() {
 
     /** Android 9 及以下导出音频时用 SAF 选择保存位置 */
     private var pendingExportItem: LibraryItem? = null
+    private var pendingExportFormat: AudioExporter.Format = AudioExporter.Format.M4A
     private val createAudioDoc = registerForActivityResult(
-        ActivityResultContracts.CreateDocument("audio/wav")
+        ActivityResultContracts.CreateDocument("audio/*")
     ) { uri ->
         val item = pendingExportItem
+        val format = pendingExportFormat
         pendingExportItem = null
-        if (uri != null && item != null) startExport(item, uri)
+        if (uri != null && item != null) startExport(item, format, uri)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -309,7 +311,8 @@ class LibraryActivity : AppCompatActivity() {
     }
 
     /**
-     * 导出这本书的完整音频为 WAV。
+     * 导出这本书的完整音频。先选格式：
+     * M4A/AAC 与 MP3 为 64kbps 压缩，体积约为 WAV 的十分之一；WAV 为无损。
      * Android 10+ 直接写入系统「音乐/EbookVoiceReader」，其它播放器自动可见；
      * 更低版本弹 SAF 让用户选保存位置。
      */
@@ -319,19 +322,40 @@ class LibraryActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.export_not_done, Toast.LENGTH_SHORT).show()
             return
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startExport(item, null)
-        } else {
-            pendingExportItem = item
-            runCatching { createAudioDoc.launch(AudioExporter.safeFileName(item.title)) }
-                .onFailure {
-                    pendingExportItem = null
-                    Toast.makeText(this, "无法打开保存位置选择器", Toast.LENGTH_SHORT).show()
+        val formats = arrayOf(
+            AudioExporter.Format.M4A,
+            AudioExporter.Format.MP3,
+            AudioExporter.Format.WAV,
+        )
+        val labels = arrayOf(
+            getString(R.string.export_format_m4a),
+            getString(R.string.export_format_mp3),
+            getString(R.string.export_format_wav),
+        )
+        var selected = 0
+        MaterialAlertDialogBuilder(this)
+            .setTitle(getString(R.string.export_dialog_title, item.title))
+            .setSingleChoiceItems(labels, 0) { _, which -> selected = which }
+            .setPositiveButton(R.string.export_start) { _, _ ->
+                val format = formats[selected]
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startExport(item, format, null)
+                } else {
+                    pendingExportItem = item
+                    pendingExportFormat = format
+                    runCatching {
+                        createAudioDoc.launch(AudioExporter.safeFileName(item.title, format))
+                    }.onFailure {
+                        pendingExportItem = null
+                        Toast.makeText(this, "无法打开保存位置选择器", Toast.LENGTH_SHORT).show()
+                    }
                 }
-        }
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
     }
 
-    private fun startExport(item: LibraryItem, safUri: Uri?) {
+    private fun startExport(item: LibraryItem, format: AudioExporter.Format, safUri: Uri?) {
         val meta = cache.metaOf(item.bookId) ?: return
         val density = resources.displayMetrics.density
         val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -356,7 +380,7 @@ class LibraryActivity : AppCompatActivity() {
             addView(textView)
         }
         val dialog = MaterialAlertDialogBuilder(this)
-            .setTitle(getString(R.string.export_dialog_title, item.title))
+            .setTitle(getString(R.string.export_running_title, item.title, format.extension.uppercase()))
             .setView(container)
             .setCancelable(false)
             .create()
@@ -365,7 +389,7 @@ class LibraryActivity : AppCompatActivity() {
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    AudioExporter.exportWav(this@LibraryActivity, cache, meta, safUri) { done, total ->
+                    AudioExporter.export(this@LibraryActivity, cache, meta, format, safUri) { done, total ->
                         runOnUiThread {
                             if (dialog.isShowing) {
                                 progressBar.isIndeterminate = false
