@@ -8,14 +8,19 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -26,9 +31,13 @@ import com.ebook.voicereader.convert.TaskInfo
 import com.ebook.voicereader.convert.TaskStatus
 import com.ebook.voicereader.databinding.ActivityLibraryBinding
 import com.ebook.voicereader.databinding.ItemBookCoverBinding
+import com.ebook.voicereader.export.AudioExporter
 import com.ebook.voicereader.reader.DocumentReaderFactory
 import com.ebook.voicereader.tts.TtsManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 /**
@@ -58,6 +67,16 @@ class LibraryActivity : AppCompatActivity() {
     private lateinit var adapter: LibraryAdapter
     /** 自动续转每次进入书库只尝试一次，避免反复拉起服务 */
     private var autoResumeDone = false
+
+    /** Android 9 及以下导出音频时用 SAF 选择保存位置 */
+    private var pendingExportItem: LibraryItem? = null
+    private val createAudioDoc = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("audio/wav")
+    ) { uri ->
+        val item = pendingExportItem
+        pendingExportItem = null
+        if (uri != null && item != null) startExport(item, uri)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -265,7 +284,7 @@ class LibraryActivity : AppCompatActivity() {
         updateSettingsValues()
     }
 
-    /** 长按书籍卡片：按当前状态提供暂停 / 继续转换 / 删除。 */
+    /** 长按书籍卡片：按当前状态提供暂停 / 继续转换 / 导出音频 / 删除。 */
     private fun showBookActions(item: LibraryItem) {
         val actions = mutableListOf<String>()
         val handlers = mutableListOf<() -> Unit>()
@@ -276,7 +295,9 @@ class LibraryActivity : AppCompatActivity() {
             ItemStatus.PENDING, ItemStatus.PAUSED, ItemStatus.PARTIAL, ItemStatus.FAILED -> {
                 actions += "继续转换"; handlers += { resumeConvert(item) }
             }
-            ItemStatus.DONE -> Unit
+            ItemStatus.DONE -> {
+                actions += getString(R.string.book_action_export); handlers += { exportAudio(item) }
+            }
         }
         actions += "删除书籍"; handlers += { confirmDelete(item) }
 
@@ -285,6 +306,94 @@ class LibraryActivity : AppCompatActivity() {
             .setItems(actions.toTypedArray()) { _, which -> handlers.getOrNull(which)?.invoke() }
             .setNegativeButton(R.string.cancel, null)
             .show()
+    }
+
+    /**
+     * 导出这本书的完整音频为 WAV。
+     * Android 10+ 直接写入系统「音乐/EbookVoiceReader」，其它播放器自动可见；
+     * 更低版本弹 SAF 让用户选保存位置。
+     */
+    private fun exportAudio(item: LibraryItem) {
+        val meta = cache.metaOf(item.bookId)
+        if (meta == null || meta.status != CacheManager.Status.DONE) {
+            Toast.makeText(this, R.string.export_not_done, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startExport(item, null)
+        } else {
+            pendingExportItem = item
+            runCatching { createAudioDoc.launch(AudioExporter.safeFileName(item.title)) }
+                .onFailure {
+                    pendingExportItem = null
+                    Toast.makeText(this, "无法打开保存位置选择器", Toast.LENGTH_SHORT).show()
+                }
+        }
+    }
+
+    private fun startExport(item: LibraryItem, safUri: Uri?) {
+        val meta = cache.metaOf(item.bookId) ?: return
+        val density = resources.displayMetrics.density
+        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            isIndeterminate = true
+        }
+        val textView = TextView(this).apply {
+            text = getString(R.string.export_preparing)
+            setPadding(0, (12 * density).toInt(), 0, 0)
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val pad = (20 * density).toInt()
+            setPadding(pad, pad / 2, pad, 0)
+            addView(
+                progressBar,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            addView(textView)
+        }
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(getString(R.string.export_dialog_title, item.title))
+            .setView(container)
+            .setCancelable(false)
+            .create()
+        dialog.show()
+
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    AudioExporter.exportWav(this@LibraryActivity, cache, meta, safUri) { done, total ->
+                        runOnUiThread {
+                            if (dialog.isShowing) {
+                                progressBar.isIndeterminate = false
+                                progressBar.progress = done * 1000 / total.coerceAtLeast(1)
+                                textView.text = getString(R.string.export_progress, done, total)
+                            }
+                        }
+                    }
+                }
+            }
+            if (dialog.isShowing) dialog.dismiss()
+            result.onSuccess {
+                Toast.makeText(
+                    this@LibraryActivity,
+                    getString(
+                        R.string.export_success, it.displayPath,
+                        (it.durationSeconds / 60).roundToInt(),
+                    ),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }.onFailure {
+                Toast.makeText(
+                    this@LibraryActivity,
+                    getString(R.string.export_failed, it.message ?: "未知错误"),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
     }
 
     /** 暂停这本书的转换：已完成片段和断点都保留，随时可继续。 */
